@@ -19,7 +19,9 @@ plugins {
 android {
     namespace = "io.github.hyperisland"
     compileSdk {
-        version = release(36)
+        version = release(37) {
+            minorApiLevel = 2
+        }
     }
     ndkVersion = "28.2.13676358"
 
