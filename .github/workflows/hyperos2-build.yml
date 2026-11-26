@@ -5,6 +5,10 @@ on:
   push:
     branches: [main, master, 'hos2/**', 'hos3/**']
 
+concurrency:
+  group: hyperisland-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
