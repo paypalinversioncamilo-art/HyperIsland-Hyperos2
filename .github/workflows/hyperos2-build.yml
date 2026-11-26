@@ -1,0 +1,60 @@
+
+name: HyperIsland HyperOS 2 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Instalar Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar herramientas Android
+        run: |
+          sdkmanager --install "platforms;android-37-ext2" "ndk;28.2.13676358"
+          yes | sdkmanager --licenses
+
+      - name: Preparar Gradle
+        run: chmod +x android/gradlew
+
+      - name: Compilar APK
+        run: |
+          ./android/gradlew -p android --no-daemon :app:assembleReleaseFast \
+            -PbuildTime="$(date -u '+%Y-%m-%d %H:%M UTC')" \
+            -PappVersionName="3.3.3-hos2.${GITHUB_RUN_NUMBER}" \
+            -PappVersionCode="$((2026112501 + GITHUB_RUN_NUMBER))"
+
+      - name: Buscar APK
+        run: |
+          APK=$(find android -type f -path '*/outputs/apk/releaseFast/*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "No se encontró el APK"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$APK" dist/HyperIsland-HyperOS2.apk
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperIsland-HyperOS2-APK
+          path: dist/HyperIsland-HyperOS2.apk
+          retention-days: 30
