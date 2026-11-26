@@ -35,9 +35,23 @@ jobs:
             exit 1
           fi
           echo "SDKMANAGER=$SDKMANAGER"
-          # sdkmanager cierra stdin al terminar; evitar que el SIGPIPE de yes tumbe el job.
+          # Android 37.2 se instala desde el paquete oficial: algunos cmdline-tools aún no indexan este minor API.
           yes | "$SDKMANAGER" --licenses || true
-          "$SDKMANAGER" --install "platforms;android-36" "ndk;28.2.13676358"
+          "$SDKMANAGER" --install "build-tools;37.0.0" "ndk;28.2.13676358"
+          PLATFORM_ZIP="$RUNNER_TEMP/platform-37.2_r01.zip"
+          PLATFORM_TMP="$RUNNER_TEMP/android-platform-37.2"
+          curl --fail --location --retry 3 --retry-delay 2 "https://dl.google.com/android/repository/platform-37.2_r01.zip" --output "$PLATFORM_ZIP"
+          mkdir -p "$PLATFORM_TMP" "$ANDROID_HOME/platforms/android-37.2"
+          unzip -q "$PLATFORM_ZIP" -d "$PLATFORM_TMP"
+          PLATFORM_SOURCE="$(find "$PLATFORM_TMP" -type f -name source.properties -print -quit)"
+          if [ -z "$PLATFORM_SOURCE" ]; then
+            echo "::error::El paquete oficial Android 37.2 no contiene source.properties"
+            exit 1
+          fi
+          PLATFORM_DIR="$(dirname "$PLATFORM_SOURCE")"
+          cp -a "$PLATFORM_DIR/." "$ANDROID_HOME/platforms/android-37.2/"
+          grep -E "^(Pkg.Desc|Pkg.Revision|AndroidVersion.ApiLevel)=" "$ANDROID_HOME/platforms/android-37.2/source.properties"
+          test -f "$ANDROID_HOME/platforms/android-37.2/android.jar"
 
       - name: Preparar Gradle
         run: chmod +x android/gradlew
