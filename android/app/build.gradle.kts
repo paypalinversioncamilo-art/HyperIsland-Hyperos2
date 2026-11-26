@@ -19,9 +19,7 @@ plugins {
 android {
     namespace = "io.github.hyperisland"
     compileSdk {
-        version = release(37) {
-            minorApiLevel = 2
-        }
+        version = release(36)
     }
     ndkVersion = "28.2.13676358"
 
@@ -75,7 +73,7 @@ android {
     defaultConfig {
         applicationId = "io.github.hyperisland"
         minSdk = 33
-        targetSdk = 37
+        targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
         buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
