@@ -237,12 +237,10 @@ class Hos2IslandListenerService : NotificationListenerService() {
             y = dp(8)
         }
 
-        container.setOnClickListener {
-            val intent = activeIntent
-            if (intent != null) runCatching { intent.send() } else toggleExpanded()
-        }
+        container.setOnClickListener { toggleExpanded() }
         container.setOnLongClickListener {
-            dismiss()
+            val intent = activeIntent
+            if (intent != null) runCatching { intent.send() } else dismiss()
             true
         }
         container.setOnTouchListener { _, event ->
