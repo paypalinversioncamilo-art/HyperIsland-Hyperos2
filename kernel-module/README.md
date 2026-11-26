@@ -1,31 +1,30 @@
-# HOS3 Visual Hybrid — Kernel module companion
+# HOS3 Visual Hybrid — KernelSU diagnostics companion
 
-This is the safe first-stage module scaffold for Redmi Note 13 4G (sapphire).
+**This ZIP is optional diagnostics only. It is not the Dynamic Island engine and is not required to display the visual island.**
+
+The actual visual engine is the HyperIsland APK, installed as a Vector/libxposed module. Vector loads the hooks; KernelSU does not replace that runtime.
 
 ## Safety contract
 
-- Does not patch boot, init_boot, vendor_boot, recovery, or any firmware partition.
+- Does not patch boot, init_boot, vendor_boot, recovery, or firmware partitions.
 - Does not replace SystemUI, Settings, Launcher, framework, or vendor APKs.
 - Includes `skip_mount`, so no `/system` overlay is mounted.
-- The boot service only records basic compatibility facts in `/data/adb/HOS3VisualHybrid/status.log`.
-- It does not alter SELinux, properties, permissions of system apps, or kernel parameters.
-
-## Important limitation
-
-This is a diagnostic companion, not yet a visual theme. A KernelSU-style ZIP cannot provide a full HyperOS 3 appearance by itself. Visual behavior must be implemented by a compatible Vector/libxposed module and safe user-space assets. This scaffold deliberately avoids pretending that a placeholder ZIP changes the UI.
+- The boot service only records device/runtime facts in `/data/adb/HOS3VisualHybrid/status.log`.
+- Does not alter SELinux, system-app permissions, properties, or kernel parameters.
 
 ## Target
 
-- Device: Redmi Note 13 4G, codename `sapphire`
-- Base: HyperOS 2 / Android 15
-- Root: temporary KernelSU exploit environment (must expose the standard module installer and persist module files under `/data/adb/modules`)
-- Hook runtime: Vector 2.2 / libxposed
+- Redmi Note 13 4G (`sapphire`)
+- HyperOS 2 Global / Android 15
+- Temporary KernelSU exploit environment
+- Vector 2.2 / libxposed runtime for the APK
 
 ## Install
 
-Install the ZIP through the KernelSU manager only if its module installer is available and accepts third-party modules. Do not flash it from custom recovery. If the temporary root session is lost, the module cannot run until the root manager/runtime is available again.
+Only install this ZIP through the KernelSU manager if you specifically want its diagnostic status log. Do not flash it from recovery. If temporary root is lost, the diagnostic service cannot run until the root manager is available again.
 
-After reboot, inspect:
+After boot, inspect:
+
 `/data/adb/HOS3VisualHybrid/status.log`
 
 Uninstall from the root manager. Because the module uses `skip_mount`, it has no system overlay to roll back.
