@@ -116,7 +116,8 @@ internal class HomeOverviewState(private val prefs: FlutterPrefsRepository) {
                 .orEmpty()
             val hasSystemUiScope = SYSTEM_UI_PACKAGE in scopePackages
             info to ModuleState(
-                active = apiVersion >= MIN_SUPPORTED_API && hasSystemUiScope,
+                active = apiVersion >= MIN_SUPPORTED_API && hasSystemUiScope &&
+                    info.focusProtocolVersion == REQUIRED_FOCUS_PROTOCOL,
                 serviceConnected = true,
                 framework = frameworkInfo["frameworkName"]?.toString().orEmpty(),
                 frameworkVersion = frameworkInfo["frameworkVersion"]?.toString().orEmpty(),
