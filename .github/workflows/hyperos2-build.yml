@@ -64,14 +64,30 @@ jobs:
             -PappVersionCode="$((2026112501 + GITHUB_RUN_NUMBER))"
 
       - name: Buscar APK
+        shell: bash
         run: |
-          APK=$(find android -type f -path '*/outputs/apk/releaseFast/*.apk' -print -quit)
+          set -euo pipefail
+          echo "Archivos APK generados:"
+          find android -type f -name '*.apk' -print | sort
+          APK="$(find android -type f -name '*.apk' -print | sort | grep -E '/outputs/apk/[^/]+/[^/]+\.apk
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperIsland-HyperOS2-APK
+          path: dist/HyperIsland-HyperOS2.apk
+          retention-days: 30
+ | head -n 1 || true)"
           if [ -z "$APK" ]; then
-            echo "No se encontró el APK"
+            echo "::error::Gradle terminó, pero no se encontró ningún APK dentro de android/"
+            find android -type d -path '*/outputs/*' -print || true
             exit 1
           fi
+          echo "APK seleccionado: $APK"
           mkdir -p dist
           cp "$APK" dist/HyperIsland-HyperOS2.apk
+          test -s dist/HyperIsland-HyperOS2.apk
+          ls -lh dist/HyperIsland-HyperOS2.apk
 
       - name: Guardar APK
         uses: actions/upload-artifact@v4
