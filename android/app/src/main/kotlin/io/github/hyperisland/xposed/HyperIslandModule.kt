@@ -1,0 +1,224 @@
+package io.github.hyperisland.xposed
+
+import io.github.hyperisland.xposed.hook.SystemUI.DynamicIslandVisibilityHook
+import io.github.hyperisland.xposed.hook.SystemUI.BackGround.IslandBlurHook
+import io.github.hyperisland.xposed.hook.SystemUI.outline.IslandOutlineHook
+import io.github.hyperisland.xposed.hook.SystemUI.geometry.BigIslandMinWidthHook
+import io.github.hyperisland.xposed.hook.SystemUI.geometry.IslandIconHook
+import io.github.hyperisland.xposed.hook.SystemUI.geometry.IslandTextSizeHook
+import io.github.hyperisland.xposed.hook.SystemUI.geometry.IslandTopOffsetHook
+import io.github.hyperisland.xposed.hook.SystemUI.IslandTransitionVisualHook
+import io.github.hyperisland.xposed.hook.SystemUI.behavior.IslandSwipeActionHook
+import io.github.hyperisland.xposed.hook.SystemUI.behavior.SingleIslandDispatchHook
+import io.github.hyperisland.xposed.hook.SystemUI.animation.ExpandedCollapseAnimationHook
+import io.github.hyperisland.xposed.hook.SystemUI.animation.ExpandedLivelyAnimationHook
+import io.github.hyperisland.xposed.hook.SystemUI.animation.ExpandedPressTiltHook
+import io.github.hyperisland.xposed.hook.SystemUI.animation.ExpandedLayoutHook
+import io.github.hyperisland.xposed.hook.SystemUI.animation.ExpandedGestureFollowHook
+import io.github.hyperisland.xposed.hook.SystemUI.corner.IslandCornerHook
+import io.github.hyperisland.xposed.hook.SystemUI.corner.IslandOfficialMaterialCornerHook
+import io.github.hyperisland.xposed.hook.SystemUI.lockscreen.LockscreenNegativePageHook
+import io.github.hyperisland.xposed.hook.SystemUI.lockscreen.LockscreenWidgetPageHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.SmallIslandIconHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.SmoothIslandHook
+import io.github.hyperisland.xposed.hook.ActiveIslandDismissHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.BluetoothIslandHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.HeartRateIslandHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.ChargeIslandHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.MusicIslandSpectrumHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.ScreenshotTempHideHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.HomeAssistantIslandHook
+import io.github.hyperisland.xposed.hook.Screenshot.ScreenshotSignalHook
+import io.github.hyperisland.xposed.hook.DownloadHook
+import io.github.hyperisland.xposed.hook.FocusNotifStatusBarIconHook
+import io.github.hyperisland.xposed.hook.IslandMiniBarHook
+import io.github.hyperisland.xposed.hook.NotificationMiniBarHook
+import io.github.hyperisland.xposed.hook.FocusNotificationTextColorHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.FaceUnlockStateHook
+import io.github.hyperisland.xposed.hook.SystemUI.lockscreen.LockscreenFaceUnlockUiHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.KeyguardUnlockStateHook
+import io.github.hyperisland.xposed.hook.MediaNotificationTextColorHook
+import io.github.hyperisland.xposed.hook.PermissionManager.ClipboardToastHook
+import io.github.hyperisland.xposed.hook.SystemUI.notification.GenericProgressHook
+import io.github.hyperisland.xposed.hook.SystemUI.notification.proxy.ProxyNotificationActionHook
+import io.github.hyperisland.xposed.hook.SystemUI.notification.proxy.ProxySourceHeadsUpSuppressHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.WifiTileDisconnectHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.BluetoothUnlockToastHook
+import io.github.hyperisland.xposed.hook.SystemUI.BackGround.IslandBackgroundHook
+import io.github.hyperisland.xposed.hook.SystemUI.geometry.IslandDimenHook
+import io.github.hyperisland.xposed.hook.SystemUI.IslandIconColorHook
+import io.github.hyperisland.xposed.hook.IslandDispatcherHook
+import io.github.hyperisland.xposed.hook.SystemUI.outline.IslandOuterGlowHook
+import io.github.hyperisland.xposed.hook.IslandBurnInDebugHook
+import io.github.hyperisland.xposed.hook.IslandTextColorHook
+import io.github.hyperisland.xposed.hook.KeepIslandHook
+import io.github.hyperisland.xposed.hook.MarqueeHook
+import io.github.hyperisland.xposed.hook.SettingsHomeEntryHook
+import io.github.hyperisland.xposed.hook.TextShadeHook
+import io.github.hyperisland.xposed.hook.TempHiddenBehaviorHook
+import io.github.hyperisland.xposed.hook.IslandFontTuningHook
+import io.github.hyperisland.xposed.hook.IslandTextAlignHook
+import io.github.hyperisland.xposed.hook.TimerTextColorHook
+import io.github.hyperisland.xposed.hook.SystemUI.text.TimerWatcherCompatHook
+import io.github.hyperisland.xposed.hook.StatusBarTextColorHook
+import io.github.hyperisland.xposed.hook.ScreenRecorder.ScreenRecorderHook
+import io.github.hyperisland.xposed.hook.SystemUI.toast.ToastUiInterceptHook
+import io.github.hyperisland.xposed.hook.SystemUI.extensions.UnlockAllFocusHook
+import io.github.hyperisland.xposed.hook.UnlockFocusAuthHook
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
+import io.github.libxposed.api.XposedModule
+import io.github.hyperisland.xposed.utils.HookUtils
+import io.github.hyperisland.xposed.diagnostics.IslandPerformanceMonitor
+
+/**
+ * 模块主入口，继承 XposedModule。
+ * 框架在各目标进程加载时回调 [onPackageLoaded]，由此分发到各子 Hook。
+ */
+class HyperIslandModule : XposedModule() {
+
+    private var configManagerInitialized = false
+
+    override fun onPackageLoaded(param: PackageLoadedParam) {
+        initializeConfigManager()
+        log { "onPackageLoaded: pkg=${param.packageName}" }
+        
+        when (param.packageName) {
+            "com.android.systemui" -> {
+                IslandPerformanceMonitor.init(this, param)
+                HookUtils.initializeLoaderDiagnostics(this, param.defaultClassLoader)
+                if (ConfigManager.getBoolean("pref_face_unlock_island", false)) {
+                    FaceUnlockStateHook.init(this, param)
+                    KeyguardUnlockStateHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_hide_lockscreen_face_unlock_icon", false)) {
+                    LockscreenFaceUnlockUiHook.init(this, param)
+                }
+                if (LockscreenWidgetPageHook.isNegativePageEnabled()) {
+                    LockscreenNegativePageHook.init(this, param)
+                }
+                IslandDispatcherHook.init(this, param)
+                GenericProgressHook.init(this, param)
+                ProxyNotificationActionHook.init(this, param)
+                ProxySourceHeadsUpSuppressHook.init(this, param)
+                ActiveIslandDismissHook.init(this, param)
+                TimerWatcherCompatHook.init(this, param)
+                MarqueeHook.init(this, param)
+                IslandTextSizeHook.init(this, param)
+                BigIslandMinWidthHook.init(this, param)
+                IslandIconHook.init(this, param)
+                IslandIconColorHook.init(this, param)
+                UnlockAllFocusHook.init(this, param)
+                FocusNotifStatusBarIconHook.init(this, param)
+                IslandMiniBarHook.init(this, param)
+                NotificationMiniBarHook.init(this, param)
+                IslandOuterGlowHook.init(this, param)
+                IslandBurnInDebugHook.init(this, param)
+                IslandBackgroundHook.init(this, param)
+                IslandBlurHook.init(this, param)
+                IslandTransitionVisualHook.init(this, param)
+                ExpandedCollapseAnimationHook.init(this, param)
+                ExpandedLivelyAnimationHook.init(this, param)
+                ExpandedPressTiltHook.init(this, param)
+                ExpandedLayoutHook.init(this, param)
+                ExpandedGestureFollowHook.init(this, param)
+                IslandCornerHook.init(this, param)
+                IslandOfficialMaterialCornerHook.init(this, param)
+                StatusBarTextColorHook.init(this, param)
+                IslandTextColorHook.init(this, param)
+                TimerTextColorHook.init(this, param)
+                IslandFontTuningHook.init(this, param)
+                IslandTextAlignHook.init(this, param)
+                FocusNotificationTextColorHook.init(this, param)
+                MediaNotificationTextColorHook.init(this, param)
+                TextShadeHook.init(this, param)
+                IslandDimenHook.init(this, param)
+                IslandTopOffsetHook.init(this, param)
+                IslandOutlineHook.init(this, param)
+                if (ConfigManager.getBoolean("pref_temp_hide_behavior_enabled", false)) {
+                    TempHiddenBehaviorHook.init(this, param)
+                }
+                // Hook 拓展：截屏时隐藏超级岛（执行端）。
+                // 始终 init（只为注册配置监听），装不装 Hook 由它自己按开关决定：
+                // 开关关着时一个 Hook 都不注入，打开时再当场补装，省掉一次 SystemUI 重启。
+                ScreenshotTempHideHook.init(this, param)
+                if (ConfigManager.getBoolean("pref_smooth_island", false)) {
+                    SmoothIslandHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_small_island_icon_adjustment", false)) {
+                    SmallIslandIconHook.init(this, param)
+                }
+                ToastUiInterceptHook.init(this, param)
+                DynamicIslandVisibilityHook.init(this, param)
+                IslandSwipeActionHook.init(this, param)
+                SingleIslandDispatchHook.init(this, param)
+                KeepIslandHook.init(this, param)
+                if (ConfigManager.getBoolean("pref_wifi_tile_disconnect_only", false)) {
+                    WifiTileDisconnectHook.init(this, param)
+                }
+                // 蓝牙解锁提示：与其它拓展一致，关闭时连 init 都不进（零注入、零监听）。
+                if (ConfigManager.getBoolean("pref_disable_bluetooth_unlock_toast", false)) {
+                    BluetoothUnlockToastHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_bluetooth_island", false)) {
+                    BluetoothIslandHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_heart_rate_island", false)) {
+                    HeartRateIslandHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_charge_island", false)) {
+                    ChargeIslandHook.init(this, param)
+                }
+                if (ConfigManager.getBoolean("pref_music_island_spectrum", false)) {
+                    MusicIslandSpectrumHook.init(this, param)
+                }
+                // Home Assistant 拓展：不建后台服务，只注入 SystemUI；启用与否在 Hook 内部按配置判断，
+                // 因此总开关无需重启 SystemUI。
+                HomeAssistantIslandHook.init(this, param)
+            }
+
+            "miui.systemui.plugin" ->
+                HookUtils.discoverPluginLoader(this, param.defaultClassLoader)
+
+            "com.android.providers.downloads" ->
+                DownloadHook.init(this, param)
+
+            "com.xiaomi.xmsf" ->
+                UnlockFocusAuthHook.init(this, param)
+
+            "com.android.settings" ->
+                if (ConfigManager.getBoolean("pref_settings_home_entry", true)) {
+                    SettingsHomeEntryHook.init(this, param)
+                }
+
+            "com.miui.screenrecorder" ->
+                if (ConfigManager.getBoolean("pref_screen_recorder_island", false)) {
+                    ScreenRecorderHook.init(this, param)
+                }
+
+            // Hook 拓展：截屏时隐藏超级岛（信号源）。
+            // 开关判断放在 Hook 内部：init 本身只注册配置监听，未开启时不注入任何 Hook。
+            "com.miui.screenshot" ->
+                ScreenshotSignalHook.init(this, param)
+
+            "com.miui.securitycenter" -> {
+                val enabled = ConfigManager.getBoolean("pref_clipboard_toast_conversion", false)
+                if (enabled) {
+                    ClipboardToastHook.init(this, param)
+                }
+            }
+
+            "com.milink.service" ->
+                if (LockscreenWidgetPageHook.isDeviceCenterMode()) {
+                    LockscreenNegativePageHook.init(this, param)
+                }
+
+        }
+    }
+
+    private fun initializeConfigManager() {
+        if (!configManagerInitialized) {
+            ConfigManager.init(this)
+            configManagerInitialized = true
+        }
+    }
+}

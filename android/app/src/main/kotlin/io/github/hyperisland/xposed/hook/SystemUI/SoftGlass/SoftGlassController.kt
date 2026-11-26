@@ -1,0 +1,964 @@
+package io.github.hyperisland.xposed.hook.SystemUI.SoftGlass
+
+import io.github.hyperisland.xposed.diagnostics.profiledHook
+import io.github.hyperisland.xposed.diagnostics.IslandPerformanceMonitor
+import io.github.hyperisland.xposed.hook.SystemUI.BackGround.Blur.lifecycle.IslandStateResolver
+import io.github.hyperisland.xposed.utils.WeakMemberCache
+import io.github.hyperisland.xposed.ConfigManager
+import io.github.hyperisland.xposed.hook.StatusBarTextColorHook
+import io.github.hyperisland.utils.SoftGlassSceneBrightnessConfig
+
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Rect
+import android.graphics.drawable.Drawable
+import android.util.TypedValue
+import android.view.View
+import android.view.ViewOutlineProvider
+import android.view.ViewTreeObserver
+import android.os.Handler
+import android.os.Looper
+import java.lang.ref.WeakReference
+import io.github.hyperisland.xposed.log
+import io.github.hyperisland.xposed.logWarn
+import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Method
+import java.lang.reflect.Field
+import java.util.Collections
+import java.util.WeakHashMap
+
+/**
+ * Per-View renderer for Xiaomi's native Bionics soft-glass material.
+ *
+ * Material ownership and rendering ownership are intentionally separate. A View can be prepared
+ * before its first frame, but only a rendering lease is allowed to keep the shared window/pass
+ * sampler alive. Xiaomi's close requests are rewritten at their source while a lease exists.
+ */
+internal object SoftGlassController {
+    private const val TAG = "HyperIsland[SoftGlass]"
+    private const val WINDOW_VIEW_CLASS =
+        "miui.systemui.dynamicisland.window.DynamicIslandWindowView"
+    private const val CONTENT_VIEW_CLASS =
+        "miui.systemui.dynamicisland.window.content.DynamicIslandContentView"
+    private const val FAKE_CONTENT_VIEW_CLASS =
+        "miui.systemui.dynamicisland.window.content.DynamicIslandContentFakeView"
+    private const val SYSTEM_SMALL_BLUR_RADIUS = 50
+    private const val SYSTEM_BIG_BLUR_RADIUS = 500
+    private val managedViews = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val renderingViews = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val stockStates = Collections.synchronizedMap(WeakHashMap<View, StockViewState>())
+    private val detachListeners = Collections.synchronizedMap(
+        WeakHashMap<View, View.OnAttachStateChangeListener>(),
+    )
+    private val appliedConfigs = Collections.synchronizedMap(WeakHashMap<View, SoftGlassConfig>())
+    private val retireHandler = Handler(Looper.getMainLooper())
+    @Volatile private var sceneReflectionLighten: Double? = null
+    private val sceneBrightnessRefresh = Runnable { refreshSceneBrightness() }
+    private data class Retirement(
+        val observer: WeakReference<ViewTreeObserver>,
+        val listener: ViewTreeObserver.OnPreDrawListener,
+        val timeout: Runnable,
+        val pauseOnly: Boolean,
+    )
+    private val retirements = WeakHashMap<View, Retirement>()
+    private val appliedWindowRadii = Collections.synchronizedMap(WeakHashMap<View, Int>())
+    private val samplingGetters = WeakMemberCache<Method>(maxClasses = 32, maxMembers = 4) { type, name ->
+        findMethod(type, name)
+    }
+    private val samplingFields = WeakMemberCache<Field>(maxClasses = 32, maxMembers = 8) { type, name ->
+        runCatching { type.getDeclaredField(name).apply { isAccessible = true } }.getOrNull()
+    }
+    private val retainedWindowBlurRoots = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val retainedPassBlurRoots = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val systemWindowBlurRoots = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val systemPassBlurRoots = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val samplerWrite = ThreadLocal<Method>()
+    private val hookedStyleClasses = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>()),
+    )
+    private val hookedCompatClasses = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>()),
+    )
+    private val hookedWindowClasses = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<Class<*>, Boolean>()),
+    )
+
+    private data class RuntimeBinding(
+        val contentClass: Class<*>,
+        val compatClass: Class<*>,
+        val params: FloatArray,
+        val setViewMode: Method,
+        val clearBlend: Method,
+        val isBionicsActive: Method,
+    )
+
+    // 18.2 exposes updatePassWindowBlur(boolean); 18.3.2.57.0 appends the owning package
+    // (updatePassWindowBlur(boolean, String)). Resolve whichever shape the plugin provides.
+    private val passBlurMethods = Collections.synchronizedMap(
+        WeakHashMap<Class<*>, java.lang.ref.WeakReference<Method>>(),
+    )
+
+    private fun passBlurMethod(clazz: Class<*>): Method? {
+        synchronized(passBlurMethods) { passBlurMethods[clazz]?.get() }?.let { return it }
+        val booleanType = Boolean::class.javaPrimitiveType!!
+        val resolved = findMethod(clazz, "updatePassWindowBlur", booleanType)
+            ?: findMethod(clazz, "updatePassWindowBlur", booleanType, String::class.java)
+            ?: return null
+        synchronized(passBlurMethods) {
+            passBlurMethods[clazz] = java.lang.ref.WeakReference(resolved)
+        }
+        return resolved
+    }
+
+    private fun passBlurArgs(method: Method, enabled: Boolean, pkg: String?): Array<Any?> =
+        if (method.parameterTypes.size >= 2) arrayOf(enabled, pkg) else arrayOf(enabled)
+
+    // Keep plugin generations isolated. Weak values are essential: Methods retain their Class.
+    private val runtimes = WeakHashMap<Class<*>, java.lang.ref.WeakReference<RuntimeBinding>>()
+    private val viewRuntimes = Collections.synchronizedMap(WeakHashMap<View, RuntimeBinding>())
+    private val bionicsRuntimeAvailable get() = synchronized(runtimes) {
+        runtimes.values.any { it.get() != null }
+    }
+
+    private fun runtimeFor(view: View): RuntimeBinding? {
+        viewRuntimes[view]?.let { return it }
+        var owner: View? = view
+        repeat(12) {
+            val current = owner ?: return null
+            var type: Class<*>? = current.javaClass
+            while (type != null) {
+                val candidate = type
+                synchronized(runtimes) { runtimes[candidate]?.get() }?.let { return it }
+                type = candidate.superclass
+            }
+            owner = current.parent as? View
+        }
+        return null
+    }
+    private var diagnosticEvents = 0
+
+    private fun loaderId(loader: ClassLoader?): String =
+        "${loader?.javaClass?.simpleName ?: "bootstrap"}@${System.identityHashCode(loader)}"
+
+    private fun diagnose(event: String, view: View) {
+        synchronized(this) {
+            if (diagnosticEvents >= 160) return
+            diagnosticEvents++
+        }
+        val root = findWindowView(view)
+        log { "$TAG trace $event view=${view.javaClass.simpleName}@${System.identityHashCode(view)} " +
+                "root=${root?.let(System::identityHashCode)} attached=${view.isAttachedToWindow} " +
+                "managed=${managedViews.contains(view)} rendering=${renderingViews.contains(view)} " +
+                "window=${root != null && retainedWindowBlurRoots.contains(root)} " +
+                "pass=${root != null && retainedPassBlurRoots.contains(root)}" }
+    }
+
+    @Synchronized
+    fun bindRuntime(module: XposedModule, contentClass: Class<*>, compatClass: Class<*>): Boolean {
+        synchronized(runtimes) {
+            runtimes.entries.removeAll { it.value.get() == null }
+            runtimes[contentClass]?.get()?.let { return it.compatClass === compatClass }
+            if (runtimes.size >= 32) return false
+        }
+        val params = runCatching {
+            val field = contentClass.getDeclaredField("EXPANDED_GLASS_TOKEN").apply {
+                isAccessible = true
+            }
+            val token = field.get(null)
+            val method = findMethod(token.javaClass, "getToBionicsParams")
+                ?: return@runCatching null
+            (method.invoke(token) as? FloatArray)?.clone()
+        }.getOrNull()
+        val styleClass = runCatching {
+            Class.forName("miui.systemui.util.MiBackgroundStyle", false, contentClass.classLoader)
+        }.getOrNull()
+        val activeMethod = styleClass?.let {
+            findMethod(it, "isBionicsActive", Context::class.java)
+        }
+        val viewModeMethod = findMethod(
+            compatClass,
+            "setMiViewBlurModeCompat",
+            View::class.java,
+            Int::class.javaPrimitiveType!!,
+        )
+        val clearBlendMethod = findMethod(
+            compatClass,
+            "clearMiBackgroundBlendColorCompat",
+            View::class.java,
+        )
+        // HyperOS versions cannot be distinguished reliably by Android SDK. These two APIs are
+        // the actual OS4 Bionics capability boundary; OS3 must remain on the Gaussian path and
+        // must not receive any of the Bionics source-writer hooks below.
+        if (params == null || activeMethod == null) {
+            log { "$TAG runtime unavailable candidate=${loaderId(contentClass.classLoader)}" }
+            return true // OS3 remains on its existing Gaussian path.
+        }
+        check(params.size >= 42 && viewModeMethod != null && clearBlendMethod != null) {
+            "Incomplete Bionics runtime candidate=${loaderId(contentClass.classLoader)} params=${params.size}"
+        }
+        val candidate = RuntimeBinding(
+            contentClass, compatClass, params, viewModeMethod, clearBlendMethod, activeMethod,
+        )
+        hookSystemWriters(module, checkNotNull(styleClass))
+        hookCompatWriters(module, compatClass)
+        synchronized(runtimes) {
+            runtimes[contentClass] = java.lang.ref.WeakReference(candidate)
+        }
+        // Source hooks retain only their own validated runtime; foreign copies cannot replace it.
+        hookRuntimeLifetime(module, contentClass, candidate)
+        log { "$TAG runtime bound bionics=$bionicsRuntimeAvailable " +
+                "params=${params.size} owner=${loaderId(contentClass.classLoader)} " +
+                "style=${loaderId(activeMethod.declaringClass.classLoader)} " +
+                "compat=${loaderId(compatClass.classLoader)}" }
+        return true
+    }
+
+    private fun hookRuntimeLifetime(module: XposedModule, contentClass: Class<*>, binding: RuntimeBinding) {
+        val method = findMethod(contentClass, "updateBackgroundBg", View::class.java,
+            Boolean::class.javaPrimitiveType!!) ?: return
+        module.profiledHook("SoftGlassController", method).intercept { chain ->
+            val target = chain.args.getOrNull(0) as? View
+            runCatching {
+                if (target != null) synchronized(viewRuntimes) {
+                    if (viewRuntimes.containsKey(target) || viewRuntimes.size < 256) {
+                        viewRuntimes[target] = binding
+                    }
+                }
+            }
+            chain.proceed()
+        }
+    }
+
+    /**
+     * Rewrites Xiaomi's shutdown transaction before it reaches the native sampler. Calling the
+     * original method with true keeps DynamicIslandWindowView's cache, FPS and native flag in one
+     * consistent state; no corrective post-write or private-field mutation is needed.
+     */
+    fun observeWindowLifecycle(module: XposedModule, windowClass: Class<*>) {
+        if (!bionicsRuntimeAvailable) return
+        if (!hookedWindowClasses.add(windowClass)) return
+        findMethod(
+            windowClass,
+            "updateWindowBlur",
+            Boolean::class.javaPrimitiveType!!,
+        )?.let { method ->
+            module.profiledHook("SoftGlassController", method).intercept { chain ->
+                val root = chain.thisObject as? View ?: return@intercept chain.proceed()
+                if (samplerWrite.get() == method) return@intercept chain.proceed()
+                val requested = chain.args.getOrNull(0) as? Boolean ?: false
+                val keepForSoft = !requested && hasRenderingView(root)
+                val result = if (keepForSoft) chain.proceed(arrayOf(true)) else chain.proceed()
+                appliedWindowRadii.remove(root)
+                recordSamplerRequest(root, requested, keepForSoft, systemWindowBlurRoots, retainedWindowBlurRoots)
+                if (requested || keepForSoft) {
+                    currentRenderingConfig(root)?.let { updateWindowRadius(root, it.blurRadius) }
+                }
+                recordSamplingState("window-blur:$requested/$keepForSoft", root)
+                diagnose("window-blur requested=$requested kept=$keepForSoft", root)
+                result
+            }
+        }
+        passBlurMethod(windowClass)?.let { method ->
+            module.profiledHook("SoftGlassController", method).intercept { chain ->
+                val root = chain.thisObject as? View ?: return@intercept chain.proceed()
+                if (samplerWrite.get() == method) return@intercept chain.proceed()
+                val requested = chain.args.getOrNull(0) as? Boolean ?: false
+                val keepForSoft = !requested && hasRenderingView(root)
+                if (requested && root in retainedPassBlurRoots && root !in systemPassBlurRoots) {
+                    // We replaced a previous native close with true to keep compact SOFT alive.
+                    // Return that lease BEFORE the native enable: otherwise Xiaomi's cached
+                    // lastPassWindowBlurEnabled=true swallows its normal sampler-open edge.
+                    // samplerWrite bypasses our keep-alive interceptor; the original enable
+                    // below still runs, even if returning our old lease fails.
+                    val returned = writeSampler(
+                        method, root, passBlurArgs(method, false, chain.args.getOrNull(1) as? String),
+                    )
+                    diagnose("pass-ownership-return accepted=$returned", root)
+                    recordSamplingState("pass-ownership-return:$returned", root)
+                }
+                val result = if (keepForSoft) {
+                    // finalizeAnimFinished() closes the sampler as soon as the open/close
+                    // animation settles. Rewrite the request instead of patching afterwards:
+                    // the original body then keeps its cache, FPS and native flag consistent.
+                    chain.proceed(passBlurArgs(method, true, chain.args.getOrNull(1) as? String))
+                } else {
+                    chain.proceed()
+                }
+                recordSamplerRequest(root, requested, keepForSoft, systemPassBlurRoots, retainedPassBlurRoots)
+                recordSamplingState("pass-blur:$requested/$keepForSoft", root)
+                diagnose("pass-blur requested=$requested kept=$keepForSoft", root)
+                result
+            }
+        }
+    }
+
+    private fun recordSamplerRequest(
+        root: View,
+        requested: Boolean,
+        kept: Boolean,
+        systemRoots: MutableSet<View>,
+        retainedRoots: MutableSet<View>,
+    ) {
+        if (requested) {
+            synchronized(systemRoots) {
+                if (systemRoots.size < 32) systemRoots.add(root)
+            }
+        } else {
+            systemRoots.remove(root)
+        }
+        // A native enable takes back ownership. Only a rewritten native disable is ours.
+        if (kept) retainedRoots.add(root) else retainedRoots.remove(root)
+    }
+
+    /** Observe stock cleanup and parameter rewrites without changing its window lifecycle. */
+    private fun hookSystemWriters(module: XposedModule, styleClass: Class<*>) {
+        if (!hookedStyleClasses.add(styleClass)) return
+        findMethod(
+            styleClass,
+            "setMiViewMaterialType",
+            View::class.java,
+            Int::class.javaPrimitiveType!!,
+        )?.let { method ->
+            module.profiledHook("SoftGlassController", method).intercept { chain ->
+                val view = chain.args.getOrNull(0) as? View
+                val type = chain.args.getOrNull(1) as? Int
+                if (view != null && type != 1 && renderingViews.contains(view)) {
+                    // The active slot owns Bionics until its source lifecycle releases the lease.
+                    // Do not let a late stock cleanup remove the material from a submitted frame.
+                    return@intercept null
+                }
+                val result = chain.proceed()
+                if (view != null && type != 1) forget(view)
+                result
+            }
+        }
+        findMethod(
+            styleClass,
+            "setMiGlassCompat",
+            View::class.java,
+            FloatArray::class.java,
+        )?.let { method ->
+            module.profiledHook("SoftGlassController", method).intercept { chain ->
+                val view = chain.args.getOrNull(0) as? View
+                val config = view?.let(appliedConfigs::get)
+                if (view != null && config != null && managedViews.contains(view)) {
+                    val source = chain.args.getOrNull(1) as? FloatArray
+                    return@intercept chain.proceed(
+                        arrayOf(view, customizeParams(source ?: baseParams(runtimeFor(view)), config)),
+                    )
+                }
+                chain.proceed()
+            }
+        }
+    }
+
+    fun apply(view: View, config: SoftGlassConfig): Boolean = runCatching {
+        cancelRetirement(view)
+        val binding = runtimeFor(view) ?: return@runCatching false
+        if (!isSystemBionicsActive(view)) {
+            diagnose("apply inactive", view)
+            release(view)
+            return@runCatching false
+        }
+        val setMaterial = findMethod(
+            view.javaClass,
+            "setMiViewMaterialType",
+            Int::class.javaPrimitiveType!!,
+        ) ?: return@runCatching false
+        val setGlass = findMethod(view.javaClass, "setMiGlass", FloatArray::class.java)
+            ?: return@runCatching false
+        if (managedViews.contains(view) && appliedConfigs[view] == config) {
+            // Same config, but the material must still be re-committed. Replacing the expanded
+            // notification child (new message) can reset the View's RenderNode material, which
+            // drops the edge-refraction/reflection channels until the next full apply. Re-apply
+            // the shader params without touching outline/stock state so the customized channels
+            // survive every content update.
+            diagnose("apply cached", view)
+        }
+        if (!managedViews.contains(view)) {
+            stockStates[view] = StockViewState(
+                background = view.background,
+                outlineProvider = view.outlineProvider,
+                clipToOutline = view.clipToOutline,
+            )
+            managedViews.add(view)
+            installOutline(view)
+            ensureDetachCleanup(view)
+        }
+        viewRuntimes[view] = binding
+        binding.setViewMode.invoke(null, view, 1)
+        binding.clearBlend.invoke(null, view)
+        setMaterial.invoke(view, 1)
+        setGlass.invoke(view, customizeParams(baseParams(binding), config))
+        view.background = null
+        appliedConfigs[view] = config
+        diagnose("apply submitted", view)
+        view.invalidate()
+        true
+    }.getOrElse { error ->
+        release(view)
+        logWarn("$TAG apply failed: ${error.message}")
+        false
+    }
+
+    fun isManaged(view: View): Boolean = managedViews.contains(view) && appliedConfigs.containsKey(view)
+    fun isActive(view: View): Boolean = isManaged(view)
+    fun hasManagedDescendant(root: View): Boolean {
+        val views = synchronized(managedViews) { managedViews.toList() }
+        return views.any { candidate ->
+            var current: View? = candidate
+            while (current != null) {
+                if (current === root) return@any true
+                current = current.parent as? View
+            }
+            false
+        }
+    }
+    fun isBionicsRuntimeAvailable(): Boolean = bionicsRuntimeAvailable
+    fun isSystemBionicsActive(view: View): Boolean = runCatching {
+        runtimeFor(view)?.isBionicsActive?.invoke(null, view.context) as? Boolean
+    }.getOrNull() == true
+
+    /** Hidden state owns neither a material RenderNode nor a sampler lease. */
+    fun suspend(view: View) = release(view, restoreBackground = false)
+
+    /** Acquires the shared sampler before the real/fake slot submits its first visible frame. */
+    fun beginRendering(view: View) {
+        if (!managedViews.contains(view) || !view.isShown) return
+        cancelRetirement(view)
+        renderingViews.add(view)
+        ensureWindowBlur(view)
+        ensurePassWindowBlur(view)
+        appliedConfigs[view]?.let { updateWindowRadius(view, it.blurRadius) }
+        findWindowView(view)?.let { root ->
+            recordSamplingState("begin-rendering:${view.javaClass.simpleName}", root)
+        }
+        diagnose("begin-rendering", view)
+    }
+
+    /** Temporarily removes only the sampler lease, retaining the prepared View material. */
+    fun pauseRendering(view: View) {
+        cancelTemporaryPause(view)
+        if (!renderingViews.remove(view)) return
+        val root = findWindowView(view) ?: return
+        if (!hasRenderingView(root)) {
+            restoreWindowRadius(root)
+            closeRetainedPassBlur(root)
+            closeRetainedWindowBlur(root)
+        }
+    }
+
+    /** Prevents Xiaomi's per-View blur-mode cleanup from racing an active material lease. */
+    private fun hookCompatWriters(module: XposedModule, compatClass: Class<*>) {
+        if (!hookedCompatClasses.add(compatClass)) return
+        findMethod(
+            compatClass,
+            "setMiViewBlurModeCompat",
+            View::class.java,
+            Int::class.javaPrimitiveType!!,
+        )?.let { method ->
+            module.profiledHook("SoftGlassController", method).intercept { chain ->
+                val view = chain.args.getOrNull(0) as? View
+                val mode = chain.args.getOrNull(1) as? Int
+                if (view != null && mode != 1 && renderingViews.contains(view)) {
+                    return@intercept chain.proceed(arrayOf(view, 1))
+                }
+                chain.proceed()
+            }
+        }
+    }
+
+    /** The shade's logical hide precedes the outgoing slot's last visible frame. */
+    fun pauseWindow(root: View, afterDraw: Boolean) {
+        val views = synchronized(renderingViews) { renderingViews.toList() }
+        views.forEach { view ->
+            if (findWindowView(view) !== root) return@forEach
+            if (afterDraw) {
+                pauseAfterDraw(view)
+            } else {
+                cancelTemporaryPause(view)
+                renderingViews.remove(view)
+            }
+        }
+    }
+
+    fun cancelWindowPauses(root: View) {
+        retirements.keys.toList().forEach { view ->
+            if (findWindowView(view) === root) cancelTemporaryPause(view)
+        }
+    }
+
+    fun pauseAfterDraw(view: View) {
+        if (view !in renderingViews || isVisibleShowOnce(view)) return
+        scheduleRetirement(view, preserveSystemSampling = false, pauseOnly = true)
+    }
+
+    /** The notification panel can hide ordinary islands while a show-once slot still draws. */
+    private fun isVisibleShowOnce(view: View): Boolean {
+        if (!view.isShown || view.windowVisibility != View.VISIBLE) return false
+        var owner = view.parent as? View
+        while (owner != null) {
+            val current = owner
+            val real = when (current.javaClass.name) {
+                CONTENT_VIEW_CLASS -> current
+                FAKE_CONTENT_VIEW_CLASS -> runCatching {
+                    findMethod(current.javaClass, "getRealView")?.invoke(current) as? View
+                }.getOrNull() ?: return false
+                else -> {
+                    owner = current.parent as? View
+                    continue
+                }
+            }
+            val state = runCatching { findMethod(real.javaClass, "getState")?.invoke(real) }.getOrNull()
+            return state?.javaClass?.simpleName == "ShowOnceBigIsland"
+        }
+        return false
+    }
+
+    fun release(
+        view: View,
+        restoreBackground: Boolean = true,
+        releaseSampling: Boolean = true,
+    ) {
+        cancelRetirement(view, includeTemporaryPause = true)
+        if (!managedViews.remove(view)) return
+        val root = findWindowView(view)
+        renderingViews.remove(view)
+        val stock = stockStates.remove(view)
+        appliedConfigs.remove(view)
+        removeDetachCleanup(view)
+        clearMaterial(view)
+        viewRuntimes.remove(view)
+        restoreOutline(view, stock)
+        if (restoreBackground && view.background == null) view.background = stock?.background
+        if (root != null && !hasRenderingView(root)) {
+            restoreWindowRadius(root)
+            if (releaseSampling) {
+                closeRetainedPassBlur(root)
+                closeRetainedWindowBlur(root)
+            } else {
+                // A DEFAULT/Gaussian/Liquid destination now owns the same SystemUI window.
+                // Relinquish bookkeeping without sending false over its freshly opened sampler.
+                retainedPassBlurRoots.remove(root)
+                retainedWindowBlurRoots.remove(root)
+            }
+        }
+    }
+
+    private fun forget(view: View) {
+        cancelRetirement(view, includeTemporaryPause = true)
+        viewRuntimes.remove(view)
+        val root = findWindowView(view)
+        managedViews.remove(view)
+        renderingViews.remove(view)
+        val stock = stockStates.remove(view)
+        appliedConfigs.remove(view)
+        removeDetachCleanup(view)
+        restoreOutline(view, stock)
+        if (root != null && !hasRenderingView(root)) {
+            restoreWindowRadius(root)
+            closeRetainedPassBlur(root)
+            closeRetainedWindowBlur(root)
+        }
+    }
+
+    /** Logical destination changes before Folme finishes drawing the outgoing expanded slot. */
+    fun retireAfterDraw(view: View, preserveSystemSampling: Boolean = false) {
+        scheduleRetirement(view, preserveSystemSampling, pauseOnly = false)
+    }
+
+    private fun scheduleRetirement(view: View, preserveSystemSampling: Boolean, pauseOnly: Boolean) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            val ref = WeakReference(view)
+            retireHandler.post { ref.get()?.let { scheduleRetirement(it, preserveSystemSampling, pauseOnly) } }
+            return
+        }
+        if (!isManaged(view)) return
+        fun finish(target: View) {
+            if (pauseOnly) {
+                pauseRendering(target)
+            } else {
+                release(target, restoreBackground = false, releaseSampling = !preserveSystemSampling)
+            }
+        }
+        if (!isDrawing(view)) {
+            finish(view)
+            return
+        }
+        retirements[view]?.let { pending ->
+            if (pauseOnly || !pending.pauseOnly) return
+            cancelRetirement(view, includeTemporaryPause = true)
+        }
+        if (retirements.size >= 128) {
+            finish(view)
+            return
+        }
+        val ref = WeakReference(view)
+        val listener = ViewTreeObserver.OnPreDrawListener {
+            ref.get()?.let { target ->
+                if (!pauseOnly && isCurrentRealSlot(target)) {
+                    cancelRetirement(target)
+                } else if (!isDrawing(target)) {
+                    finish(target)
+                }
+            }
+            true
+        }
+        val timeout = Runnable {
+            ref.get()?.let { target ->
+                // Bound a cancelled animation's lease even if no more traversals occur.
+                finish(target)
+            }
+        }
+        val observer = view.viewTreeObserver
+        if (!observer.isAlive) return
+        observer.addOnPreDrawListener(listener)
+        retirements[view] = Retirement(WeakReference(observer), listener, timeout, pauseOnly)
+        retireHandler.postDelayed(timeout, 3_000L)
+        diagnose(if (pauseOnly) "pause-after-draw" else "retire-after-draw", view)
+    }
+
+    private fun cancelTemporaryPause(view: View) {
+        if (retirements[view]?.pauseOnly == true) cancelRetirement(view, includeTemporaryPause = true)
+    }
+
+    private fun cancelRetirement(view: View, includeTemporaryPause: Boolean) {
+        val pending = retirements[view] ?: return
+        if (pending.pauseOnly && !includeTemporaryPause) return
+        retirements.remove(view)
+        pending.observer.get()?.takeIf { it.isAlive }?.removeOnPreDrawListener(pending.listener)
+        retireHandler.removeCallbacks(pending.timeout)
+    }
+
+    fun cancelRetirement(view: View) = cancelRetirement(view, includeTemporaryPause = false)
+
+    private fun isDrawing(view: View): Boolean {
+        if (!view.isAttachedToWindow || view.windowVisibility != View.VISIBLE) return false
+        var current: View? = view
+        while (current != null) {
+            if (current.visibility != View.VISIBLE || current.alpha <= 0.01f) return false
+            current = current.parent as? View
+        }
+        return true
+    }
+
+    private fun isCurrentRealSlot(view: View): Boolean {
+        val type = IslandStateResolver.forView(view) ?: return false
+        var owner = view.parent as? View
+        while (owner != null) {
+            if (owner.javaClass.name == CONTENT_VIEW_CLASS) {
+                val state = runCatching { findMethod(owner.javaClass, "getState")?.invoke(owner) }.getOrNull()
+                if (state?.javaClass?.simpleName in setOf("AppExpanded", "MiniWindowExpanded")) return false
+                return IslandStateResolver.fromState(state) == type && isDrawing(view)
+            }
+            owner = owner.parent as? View
+        }
+        return false
+    }
+
+    private fun clearMaterial(view: View) {
+        runCatching {
+            findMethod(
+                view.javaClass,
+                "setMiViewMaterialType",
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(view, 0)
+        }
+        val binding = runtimeFor(view)
+        runCatching { binding?.clearBlend?.invoke(null, view) }
+        runCatching { binding?.setViewMode?.invoke(null, view, 0) }
+        view.invalidate()
+    }
+
+    /** Bionics blur strength is a window property, not one of the 42 shader parameters. */
+    private fun updateWindowRadius(source: View, radius: Int) {
+        val root = findWindowView(source) ?: return
+        val small = radius.coerceIn(0, 100)
+        if (appliedWindowRadii[root] == small) return
+        val big = (small * 10).coerceIn(0, 1000)
+        runCatching {
+            findMethod(
+                root.javaClass,
+                "setMiGlassBlurRadius",
+                Int::class.javaPrimitiveType!!,
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(root, small, big)
+            appliedWindowRadii[root] = small
+        }.onFailure { error ->
+            logWarn("$TAG blur radius unavailable: ${error.message}")
+        }
+    }
+
+    private fun restoreWindowRadius(root: View) {
+        if (appliedWindowRadii.remove(root) == null) return
+        runCatching {
+            findMethod(
+                root.javaClass,
+                "setMiGlassBlurRadius",
+                Int::class.javaPrimitiveType!!,
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(root, SYSTEM_SMALL_BLUR_RADIUS, SYSTEM_BIG_BLUR_RADIUS)
+        }
+    }
+
+    private fun hasRenderingView(root: View): Boolean {
+        val views = synchronized(renderingViews) { renderingViews.toList() }
+        return views.any { it.isShown && findWindowView(it) === root }
+    }
+
+    private fun currentRenderingConfig(root: View): SoftGlassConfig? {
+        val views = synchronized(renderingViews) { renderingViews.toList() }
+        return views.asSequence()
+            .filter { it.isShown && findWindowView(it) === root }
+            .maxByOrNull(View::getAlpha)
+            ?.let(appliedConfigs::get)
+    }
+
+    private fun samplingValue(root: View, name: String): Any? = runCatching {
+        samplingGetters.get(root.javaClass, name)?.invoke(root)
+    }.getOrNull()
+
+    private fun nativeSamplingState(root: View): Map<String, Any?> {
+        val owner = samplingValue(root, "getViewRootImpl") ?: return emptyMap()
+        fun read(name: String): Any? = runCatching { samplingFields.get(owner.javaClass, name)?.get(owner) }.getOrNull()
+        val rect = read("mDispRect") as? Rect
+        val texturePresent = samplingFields.get(owner.javaClass, "mSurTex")?.let { field ->
+            runCatching { field.get(owner) != null }.getOrNull()
+        }
+        return mapOf(
+            "requestedTextureWidth" to rect?.width(), "requestedTextureHeight" to rect?.height(),
+            "renderBlurUsed" to read("mMiBlurUsed"), "textureVisible" to read("mTextureVis"),
+            "sfState" to read("mLastSfState"), "texturePresent" to texturePresent,
+        )
+    }
+
+    /** Called on lifecycle edges and external blur activation, only while a report is recording. */
+    fun recordSamplingState(reason: String, root: View? = null) {
+        if (IslandPerformanceMonitor.currentSession == null) return
+        val roots = if (root != null) listOf(root) else {
+            synchronized(renderingViews) { renderingViews.toList() }.mapNotNull(::findWindowView).distinct()
+        }
+        roots.forEach { target ->
+            IslandPerformanceMonitor.samplingEvent(
+                reason, target,
+                samplingValue(target, "getMiBackgroundBlurMode") as? Int,
+                samplingValue(target, "getMiBackgroundBlurRadius") as? Int,
+                samplingValue(target, "getPassWindowBlurEnabled") as? Boolean,
+                nativeSamplingState(target),
+            )
+        }
+    }
+
+    private fun ensureWindowBlur(source: View) {
+        val root = findWindowView(source) ?: return
+        if (root in retainedWindowBlurRoots || root in systemWindowBlurRoots) return
+        val method = findMethod(
+            root.javaClass,
+            "updateWindowBlur",
+            Boolean::class.javaPrimitiveType!!,
+        ) ?: return
+        if (writeSampler(method, root, arrayOf(true))) retainedWindowBlurRoots.add(root)
+    }
+
+    private fun closeRetainedWindowBlur(root: View) {
+        if (!retainedWindowBlurRoots.remove(root)) return
+        val method = findMethod(
+            root.javaClass,
+            "updateWindowBlur",
+            Boolean::class.javaPrimitiveType!!,
+        ) ?: return
+        writeSampler(method, root, arrayOf(false))
+    }
+
+    private fun ensurePassWindowBlur(source: View) {
+        val root = findWindowView(source) ?: return
+        if (root in retainedPassBlurRoots || root in systemPassBlurRoots) return
+        val method = passBlurMethod(root.javaClass) ?: return
+        if (writeSampler(method, root, passBlurArgs(method, true, null))) retainedPassBlurRoots.add(root)
+    }
+
+    private fun closeRetainedPassBlur(root: View) {
+        if (!retainedPassBlurRoots.remove(root)) return
+        val method = passBlurMethod(root.javaClass) ?: return
+        writeSampler(method, root, passBlurArgs(method, false, null))
+    }
+
+    private fun writeSampler(method: Method, root: View, args: Array<Any?>): Boolean {
+        val previous = samplerWrite.get()
+        samplerWrite.set(method)
+        return try {
+            runCatching { method.invoke(root, *args) }.isSuccess
+        } finally {
+            if (previous == null) samplerWrite.remove() else samplerWrite.set(previous)
+        }
+    }
+
+    private fun findWindowView(view: View): View? {
+        var current = view
+        while (true) {
+            if (current.javaClass.name == WINDOW_VIEW_CLASS) return current
+            current = current.parent as? View ?: return null
+        }
+    }
+
+    private fun installOutline(view: View) {
+        val maxRadius = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            32f,
+            view.resources.displayMetrics,
+        )
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(target: View, outline: Outline) {
+                outline.setRoundRect(
+                    0,
+                    0,
+                    target.width,
+                    target.height,
+                    minOf(target.height / 2f, maxRadius),
+                )
+            }
+        }
+        view.clipToOutline = true
+    }
+
+    private fun restoreOutline(view: View, stock: StockViewState?) {
+        stock ?: return
+        view.outlineProvider = stock.outlineProvider
+        view.clipToOutline = stock.clipToOutline
+    }
+
+    private fun ensureDetachCleanup(view: View) {
+        if (detachListeners.containsKey(view)) return
+        val listener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) = Unit
+
+            override fun onViewDetachedFromWindow(view: View) {
+                release(view, restoreBackground = false)
+            }
+        }
+        detachListeners[view] = listener
+        view.addOnAttachStateChangeListener(listener)
+    }
+
+    private fun removeDetachCleanup(view: View) {
+        val listener = detachListeners.remove(view) ?: return
+        view.removeOnAttachStateChangeListener(listener)
+    }
+
+    private data class StockViewState(
+        val background: Drawable?,
+        val outlineProvider: ViewOutlineProvider?,
+        val clipToOutline: Boolean,
+    )
+
+    fun requestSceneBrightnessRefresh() {
+        retireHandler.removeCallbacks(sceneBrightnessRefresh)
+        retireHandler.post(sceneBrightnessRefresh)
+    }
+
+    private fun refreshSceneBrightness() {
+        val scene = SoftGlassSceneBrightnessConfig(
+            enabled = ConfigManager.getBoolean(SoftGlassSceneBrightnessConfig.ENABLED_KEY, false),
+            whiteSceneBrightness = ConfigManager.getInt(
+                SoftGlassSceneBrightnessConfig.BRIGHTNESS_KEY,
+                SoftGlassSceneBrightnessConfig.DEFAULT_BRIGHTNESS.toInt(),
+            ).toLong(),
+        )
+        val nextOverride = scene.reflectionLightenOverride(StatusBarTextColorHook.getReadableTint() == Color.BLACK)
+        if (sceneReflectionLighten == nextOverride) return
+        sceneReflectionLighten = nextOverride
+        // Real and fake slots share this registry. Re-submit only the shader parameters,
+        // keeping their original configs and all rendering/sampling retirement leases intact.
+        val targets = synchronized(appliedConfigs) { appliedConfigs.entries.map { it.key to it.value } }
+        targets.forEach { (view, config) ->
+            if (!view.isAttachedToWindow || !isManaged(view)) return@forEach
+            val binding = runtimeFor(view) ?: return@forEach
+            runCatching {
+                findMethod(view.javaClass, "setMiGlass", FloatArray::class.java)
+                    ?.invoke(view, customizeParams(baseParams(binding), config))
+                view.invalidate()
+            }
+        }
+    }
+
+    private fun baseParams(binding: RuntimeBinding?): FloatArray = binding?.params?.clone() ?: floatArrayOf(
+        0f, 2f, .5f, .8f, .15f, 2.4f, .3f, .2f, 0f, 0f, 0f,
+        .06f, .06f, .06f, .6f, .15f, .4f, 1.36f, 1f, 72f, 3.8f,
+        80f, 1000f, 1.2f, .6f, -.4f, .6f, -.8f, 1.8f, 1.2f, 1f,
+        1.1764706f, 3f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+    )
+
+    private fun customizeParams(source: FloatArray, config: SoftGlassConfig): FloatArray {
+        val params = source.clone()
+        fun scale(index: Int, configured: Double, divisor: Float = 100f) {
+            val original = params[index]
+            params[index] = if (original == 0f) configured.toFloat()
+            else original * (1f + configured.toFloat() / divisor)
+        }
+        // Match HyperLight's native light adjustment: original * (1 + value / 10).
+        scale(4, config.softLight, divisor = 10f)
+        params[5] = (1f + config.saturation.toFloat() / 100f).coerceIn(.5f, 1.5f)
+        scale(6, config.brightness)
+        scale(7, config.darker)
+        // BionicsToken.toBionicsParams: shapeEdgePx, shapeEdgePow, reflectionLighten.
+        scale(19, config.shapeEdgeWidth)
+        scale(20, config.shapeEdgePower)
+        scale(21, config.edgeThickness)
+        // Keep the signed result: -10 disables the edge's added light, below it subtracts
+        // light in the native shader without changing the flat interior's color processing.
+        scale(23, sceneReflectionLighten ?: config.reflectionLighten, divisor = 10f)
+        scale(24, config.reflection)
+        scale(28, config.directionalLightIntensity)
+        scale(32, config.refraction)
+        scale(33, config.backgroundSaturation)
+        scale(34, config.backgroundBrightness)
+        scale(35, config.burn)
+        if (!config.highlight) {
+            params[24] = 0f
+            params[28] = 0f
+        }
+        // Xiaomi's expanded token also mixes a fixed white inner layer through channels 15/16.
+        // Keeping it after clearing the RGB tint is what makes the island look opaque gray.
+        params[15] = 0f
+        params[16] = 0f
+        val tintAlpha = Color.alpha(config.tintColor) / 255f
+        if (tintAlpha > 0f) {
+            params[11] = Color.red(config.tintColor) / 255f
+            params[12] = Color.green(config.tintColor) / 255f
+            params[13] = Color.blue(config.tintColor) / 255f
+            params[14] = (tintAlpha * (1f + config.transparency.toFloat() / 100f))
+                .coerceIn(0f, 1f)
+        } else {
+            params[11] = 0f
+            params[12] = 0f
+            params[13] = 0f
+            params[14] = 0f
+        }
+        return params
+    }
+
+    private fun findMethod(clazz: Class<*>, name: String, vararg types: Class<*>): Method? {
+        runCatching { return clazz.getMethod(name, *types).apply { isAccessible = true } }
+        var current: Class<*>? = clazz
+        while (current != null) {
+            runCatching {
+                return current.getDeclaredMethod(name, *types).apply { isAccessible = true }
+            }
+            current = current.superclass
+        }
+        return null
+    }
+}

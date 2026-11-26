@@ -1,0 +1,109 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+        超级岛广播权限（signature 级）。
+        仅与 HyperIsland 使用相同签名的应用可获得此权限，
+        保证只有本应用能触发 SystemUI 进程内的 IslandDispatcher Receiver。
+    -->
+    <permission
+        android:name="io.github.hyperisland.SEND_ISLAND"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="io.github.hyperisland.SEND_ISLAND" />
+
+    <!--
+        跨应用屏幕录制控制权限（normal 级）。
+        第三方应用在清单中声明 <uses-permission> 后即可通过
+        ScreenRecorderControlService 查询状态与控制录制。
+    -->
+    <permission
+        android:name="io.github.hyperisland.permission.CONTROL_SCREEN_RECORDER"
+        android:protectionLevel="normal" />
+
+    <!-- 下载管理权限 -->
+    <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION"/>
+    <uses-permission android:name="android.permission.ACCESS_DOWNLOAD_MANAGER"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Android 11+ 包可见性：查询所有已安装应用 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- MIUI/HyperOS 运行时权限：获取已安装应用列表 -->
+    <uses-permission android:name="com.android.permission.GET_INSTALLED_APPS"/>
+    <!-- 蓝牙权限（获取已配对设备用于白名单） -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+
+    <application
+        android:label="HyperIsland"
+        android:name=".XposedPrefsSyncApp"
+        android:enableOnBackInvokedCallback="true"
+        android:supportsRtl="true"
+        android:description="@string/module_description"
+        android:icon="@drawable/ic_launcher">
+        <!--
+            自行处理配置变更，避免系统销毁重建 Activity：
+            - locale/layoutDirection：切换应用语言（LocaleManager.applicationLocales）时不再重建，
+              消除重建导致的闪黑；Compose 会经 LocalConfiguration 自动刷新文案。
+            - orientation/screenSize/...：横竖屏、多窗口尺寸变化时保留 Compose 内的导航栈，
+              否则重建会丢失 remember 状态并退回一级页面。
+            - uiMode/density/fontScale：深色模式、显示大小、字体大小变化同样原地刷新。
+            注意：本元素是 activity-alias 的属性子集之外的属性，其取值会被别名继承。
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/ComposeTheme.Starting">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS"/>
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="https" android:host="hyperisland.1812z.top" android:path="/import-preset.html"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="hyperisland" android:host="import-preset"/>
+            </intent-filter>
+        </activity>
+        <activity-alias
+            android:name=".MainActivityAlias"
+            android:targetActivity=".MainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:label="HyperIsland"
+            android:icon="@drawable/ic_launcher">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <service
+            android:name=".screenrecorder.ScreenRecorderControlService"
+            android:exported="true"
+            android:process=":screen_recorder_control"
+            android:stopWithTask="false">
+            <intent-filter>
+                <action android:name="io.github.hyperisland.action.SCREEN_RECORDER_CONTROL" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".hos2.Hos2IslandListenerService"
+            android:label="HyperIsland HyperOS 2"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

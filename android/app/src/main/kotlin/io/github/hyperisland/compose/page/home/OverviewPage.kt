@@ -1,0 +1,624 @@
+package io.github.hyperisland.compose.page.home
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import io.github.hyperisland.R
+import io.github.hyperisland.XposedPrefsSyncApp
+import io.github.hyperisland.compose.component.AppActionTextButton
+import io.github.hyperisland.compose.component.AppActionButton
+import io.github.hyperisland.compose.component.AppTextField
+import io.github.hyperisland.compose.component.AppCard
+import io.github.hyperisland.compose.component.AppDialog
+import io.github.hyperisland.compose.component.CollapsingPage
+import io.github.hyperisland.compose.component.RestartScopeDialog
+import io.github.hyperisland.compose.component.SettingsAction
+import io.github.hyperisland.compose.component.SettingsActionWithArrow
+import io.github.hyperisland.compose.data.FlutterPrefsRepository
+import io.github.hyperisland.compose.service.HomeSystemInfo
+import io.github.hyperisland.compose.service.SystemInfoProvider
+import io.github.hyperisland.compose.service.TestNotificationService
+import io.github.hyperisland.compose.theme.LocalCardGlassSettings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import top.yukonga.miuix.kmp.basic.CardDefaults
+import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Refresh
+import top.yukonga.miuix.kmp.icon.extended.Link
+import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.utils.PressFeedbackType
+
+internal data class ModuleState(
+    val active: Boolean,
+    val serviceConnected: Boolean = false,
+    val framework: String = "",
+    val frameworkVersion: String = "",
+    val frameworkVersionCode: Int = 0,
+    val apiVersion: Int = 0,
+    val hasSystemUiScope: Boolean = false,
+)
+
+@Stable
+internal class HomeOverviewState(private val prefs: FlutterPrefsRepository) {
+    var status by mutableStateOf<ModuleState?>(null)
+        private set
+    var systemInfo by mutableStateOf<HomeSystemInfo?>(null)
+        private set
+    var enabledAppCount by mutableStateOf(prefs.enabledAppCount())
+        private set
+    var toastEnabledAppCount by mutableStateOf(prefs.toastEnabledAppCount())
+        private set
+
+    private val refreshMutex = Mutex()
+
+    fun onPreferenceChanged(key: String) {
+        if (key == "pref_generic_whitelist") enabledAppCount = prefs.enabledAppCount()
+        if (key.startsWith("pref_app_config_")) {
+            toastEnabledAppCount = prefs.toastEnabledAppCount()
+        }
+    }
+
+    suspend fun refresh(context: Context) = refreshMutex.withLock {
+        val refreshed = withContext(Dispatchers.IO) {
+            val info = SystemInfoProvider.load(context)
+            val connected = XposedPrefsSyncApp.awaitReady()
+            if (!connected) return@withContext info to ModuleState(active = false)
+            val app = context.applicationContext as XposedPrefsSyncApp
+            val frameworkInfo = runCatching { app.getFrameworkInfo() }.getOrDefault(emptyMap())
+            val apiVersion = (frameworkInfo["apiVersion"] as? Number)?.toInt() ?: 0
+            val scopePackages = (frameworkInfo["scope"] as? List<*>)
+                ?.filterIsInstance<String>()
+                .orEmpty()
+            val hasSystemUiScope = SYSTEM_UI_PACKAGE in scopePackages
+            info to ModuleState(
+                active = apiVersion >= MIN_SUPPORTED_API && hasSystemUiScope,
+                serviceConnected = true,
+                framework = frameworkInfo["frameworkName"]?.toString().orEmpty(),
+                frameworkVersion = frameworkInfo["frameworkVersion"]?.toString().orEmpty(),
+                frameworkVersionCode = (frameworkInfo["frameworkVersionCode"] as? Number)?.toInt() ?: 0,
+                apiVersion = apiVersion,
+                hasSystemUiScope = hasSystemUiScope,
+            )
+        }
+        systemInfo = refreshed.first
+        status = refreshed.second
+    }
+}
+
+@Composable
+internal fun rememberHomeOverviewState(prefs: FlutterPrefsRepository): HomeOverviewState {
+    val state = remember(prefs) { HomeOverviewState(prefs) }
+    DisposableEffect(prefs, state) {
+        val removeListener = prefs.addChangeListener(state::onPreferenceChanged)
+        onDispose(removeListener)
+    }
+    return state
+}
+
+@Composable
+internal fun OverviewPage(
+    state: HomeOverviewState,
+    isActive: Boolean,
+    onOpenApps: () -> Unit,
+    onOpenToastApps: () -> Unit,
+    onOpenDonors: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var showCustomTest by remember { mutableStateOf(false) }
+    var showRestartDialog by remember { mutableStateOf(false) }
+    val statusAlert = homeStatusAlert(state.status, state.systemInfo)
+
+    LaunchedEffect(isActive) {
+        if (isActive) state.refresh(context)
+    }
+    CollapsingPage(
+        title = "HyperIsland",
+        actionIcon = MiuixIcons.Refresh,
+        actionDescription = stringResource(R.string.restart_scope),
+        onAction = { showRestartDialog = true },
+        horizontalContentPadding = 12.dp,
+        topContentPadding = 12.dp,
+        bottomContentPadding = 16.dp,
+    ) {
+        item {
+            StatusGrid(
+                status = state.status,
+                appVersion = state.systemInfo?.appVersion,
+                enabledAppCount = state.enabledAppCount,
+                toastEnabledAppCount = state.toastEnabledAppCount,
+                onSendTest = { TestNotificationService.sendDefault(context) },
+                onCustomTest = { showCustomTest = true },
+                onOpenApps = onOpenApps,
+                onOpenToastApps = onOpenToastApps,
+            )
+        }
+        if (statusAlert != null) {
+            item { HomeStatusAlertCard(statusAlert) }
+        }
+        item { InfoCard(state.systemInfo, state.status) }
+        item {
+            AppCard {
+                SettingsAction(
+                    title = stringResource(R.string.support_development),
+                    summary = stringResource(R.string.support_development_summary),
+                    endIcon = MiuixIcons.Link,
+                    endIconSize = 26.dp,
+                    onClick = { context.openUrl(DONATION_URL) },
+                )
+                // 捐赠名单走站内原生列表（数据来自站点 JSON），不再跳网页
+                SettingsActionWithArrow(
+                    title = stringResource(R.string.donation_list),
+                    summary = stringResource(R.string.donation_list_entry_summary),
+                    onClick = onOpenDonors,
+                )
+                SettingsAction(
+                    title = stringResource(R.string.documentation),
+                    summary = stringResource(R.string.documentation_summary),
+                    endIcon = MiuixIcons.Link,
+                    endIconSize = 26.dp,
+                    onClick = { context.openUrl(DOCUMENTATION_URL) },
+                )
+                SettingsAction(
+                    title = stringResource(R.string.related_resources),
+                    summary = stringResource(R.string.related_resources_summary),
+                    endIcon = MiuixIcons.Link,
+                    endIconSize = 26.dp,
+                    onClick = { context.openUrl(RESOURCES_URL) },
+                )
+            }
+        }
+    }
+
+    CustomTestDialog(
+        show = showCustomTest,
+        enabled = state.status?.active == true,
+        onDismiss = { showCustomTest = false },
+        // 发送后不关闭对话框，便于连续调整内容反复测试。
+        onSend = { title, content, clearPrevious, enableFloat ->
+            TestNotificationService.sendCustom(
+                context = context,
+                title = title,
+                content = content,
+                clearPrevious = clearPrevious,
+                enableFloat = enableFloat,
+                expandFirst = enableFloat,
+            )
+        },
+    )
+    RestartScopeDialog(
+        show = showRestartDialog,
+        onDismiss = { showRestartDialog = false },
+    )
+}
+
+private data class HomeStatusAlert(
+    val title: String,
+    val message: String,
+    val warning: Boolean = false,
+)
+
+@Composable
+private fun homeStatusAlert(status: ModuleState?, info: HomeSystemInfo?): HomeStatusAlert? {
+    if (status == null || info == null) return null
+    return when {
+        !status.serviceConnected -> HomeStatusAlert(
+            title = stringResource(R.string.lsposed_service_unavailable),
+            message = stringResource(R.string.lsposed_service_unavailable_summary),
+        )
+        status.apiVersion < MIN_SUPPORTED_API -> HomeStatusAlert(
+            title = stringResource(R.string.lsposed_version_unsupported),
+            message = stringResource(R.string.update_lsposed),
+        )
+        !status.hasSystemUiScope -> HomeStatusAlert(
+            title = stringResource(R.string.systemui_scope_missing),
+            message = stringResource(R.string.enable_systemui_scope),
+        )
+        info.focusProtocolVersion != REQUIRED_FOCUS_PROTOCOL -> HomeStatusAlert(
+            title = stringResource(R.string.system_not_supported),
+            message = stringResource(
+                R.string.system_not_supported_summary,
+                info.focusProtocolVersion,
+                REQUIRED_FOCUS_PROTOCOL,
+            ),
+        )
+        info.androidSdkVersion == ANDROID_15_SDK -> HomeStatusAlert(
+            title = stringResource(R.string.android_15_limited),
+            message = stringResource(R.string.android_15_limited_summary),
+            warning = true,
+        )
+        else -> null
+    }
+}
+
+@Composable
+private fun HomeStatusAlertCard(alert: HomeStatusAlert) {
+    val isLight = MiuixTheme.colorScheme.background.luminance() > 0.5f
+    val backgroundColor = when {
+        !alert.warning -> MiuixTheme.colorScheme.errorContainer
+        isLight -> WarningBackgroundLight
+        else -> WarningBackgroundDark
+    }
+    val contentColor = when {
+        !alert.warning -> MiuixTheme.colorScheme.onErrorContainer
+        isLight -> WarningContentLight
+        else -> WarningContentDark
+    }
+    AppCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.defaultColors(
+            color = backgroundColor,
+            contentColor = contentColor,
+        ),
+        showIndication = false,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = alert.title,
+                color = contentColor,
+                style = MiuixTheme.textStyles.headline1,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = alert.message,
+                color = contentColor.copy(alpha = 0.82f),
+                style = MiuixTheme.textStyles.body2,
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatusGrid(
+    status: ModuleState?,
+    appVersion: String?,
+    enabledAppCount: Int,
+    toastEnabledAppCount: Int,
+    onSendTest: () -> Unit,
+    onCustomTest: () -> Unit,
+    onOpenApps: () -> Unit,
+    onOpenToastApps: () -> Unit,
+) {
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        if (maxWidth >= 600.dp) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                StatusCard(status, appVersion, Modifier.weight(1f).height(112.dp), onSendTest, onCustomTest)
+                StatCard(
+                    title = stringResource(R.string.enabled_app_islands),
+                    value = enabledAppCount.toString(),
+                    modifier = Modifier.weight(1f).height(112.dp),
+                    onClick = onOpenApps,
+                )
+                StatCard(
+                    title = stringResource(R.string.enabled_toast_islands),
+                    value = toastEnabledAppCount.toString(),
+                    modifier = Modifier.weight(1f).height(112.dp),
+                    onClick = onOpenToastApps,
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                StatusCard(status, appVersion, Modifier.weight(1f).aspectRatio(1f), onSendTest, onCustomTest)
+                Column(
+                    modifier = Modifier.weight(1f).aspectRatio(1f),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    StatCard(
+                        title = stringResource(R.string.enabled_app_islands),
+                        value = enabledAppCount.toString(),
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenApps,
+                    )
+                    StatCard(
+                        title = stringResource(R.string.enabled_toast_islands),
+                        value = toastEnabledAppCount.toString(),
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenToastApps,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusCard(
+    status: ModuleState?,
+    appVersion: String?,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+) {
+    val active = status?.active == true
+    val statusColor = if (active) ActiveColor else InactiveColor
+    val transparentBackground = LocalCardGlassSettings.current.enabled
+    val statusBackground = when {
+        transparentBackground -> Color.Transparent
+        active -> ActiveBackground
+        else -> InactiveBackground
+    }
+    val titleColor = if (transparentBackground) MiuixTheme.colorScheme.onSurface else Color(0xFF101010)
+    AppCard(
+        modifier = modifier,
+        colors = CardDefaults.defaultColors(color = statusBackground),
+        pressFeedbackType = PressFeedbackType.Tilt,
+        showIndication = active,
+        onClick = onClick.takeIf { active },
+        onLongPress = onLongPress.takeIf { active },
+        glassOnTransparentSurface = true,
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier.fillMaxSize().offset(27.dp, 31.dp),
+                contentAlignment = Alignment.BottomEnd,
+            ) {
+                Icon(
+                    modifier = Modifier.size(110.dp),
+                    painter = painterResource(R.drawable.ic_check_circle_outline),
+                    contentDescription = null,
+                    tint = statusColor.copy(alpha = 0.78f),
+                )
+            }
+            Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                Text(
+                    text = stringResource(
+                        if (active) R.string.activated else R.string.not_activated,
+                    ),
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = titleColor,
+                )
+                Text(
+                    text = stringResource(
+                        R.string.software_version,
+                        appVersion.orEmpty().ifBlank { stringResource(R.string.unknown) },
+                    ),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (active) titleColor else statusColor,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatCard(
+    title: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    AppCard(
+        modifier = modifier.fillMaxWidth(),
+        pressFeedbackType = PressFeedbackType.Tilt,
+        onClick = onClick,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(14.dp),
+            horizontalAlignment = Alignment.Start,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                text = title,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            )
+            Text(
+                text = value,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MiuixTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+}
+
+private fun Context.openUrl(url: String) {
+    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+}
+
+@Composable
+private fun InfoCard(info: HomeSystemInfo?, status: ModuleState?) {
+    val unknown = stringResource(R.string.unknown)
+    val appVersion = info?.let { "${it.appVersion} (${it.appVersionCode})" }.orEmpty().ifBlank { unknown }
+    val frameworkVersion = status
+        ?.takeIf { it.serviceConnected }
+        ?.let {
+            stringResource(
+                R.string.framework_details,
+                it.framework.ifBlank { unknown },
+                it.frameworkVersion.ifBlank { unknown },
+                it.frameworkVersionCode,
+                it.apiVersion,
+            )
+        }
+        ?: unknown
+    AppCard {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            InfoText(stringResource(R.string.system_version), info?.systemVersion.orEmpty().ifBlank { unknown })
+            InfoText(stringResource(R.string.app_version), appVersion)
+            InfoText(stringResource(R.string.xposed_framework), frameworkVersion)
+            InfoText(stringResource(R.string.device_model), info?.deviceModel.orEmpty().ifBlank { unknown }, 0.dp)
+        }
+    }
+}
+
+@Composable
+private fun InfoText(title: String, content: String, bottomPadding: androidx.compose.ui.unit.Dp = 24.dp) {
+    Text(
+        text = title,
+        fontSize = MiuixTheme.textStyles.headline1.fontSize,
+        fontWeight = FontWeight.Medium,
+        color = MiuixTheme.colorScheme.onSurface,
+    )
+    Text(
+        text = content,
+        fontSize = MiuixTheme.textStyles.body2.fontSize,
+        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+        modifier = Modifier.padding(top = 2.dp, bottom = bottomPadding),
+    )
+}
+
+@Composable
+private fun CustomTestDialog(
+    show: Boolean,
+    enabled: Boolean,
+    onDismiss: () -> Unit,
+    onSend: (String, String, Boolean, Boolean) -> Unit,
+) {
+    var title by remember(show) { mutableStateOf("") }
+    var content by remember(show) { mutableStateOf("") }
+    var clearPrevious by remember(show) { mutableStateOf(true) }
+    var enableFloat by remember(show) { mutableStateOf(true) }
+
+    AppDialog(
+        show = show,
+        title = stringResource(R.string.custom_test_notification),
+        onDismissRequest = onDismiss,
+        // 横向内边距交给各行自行提供，行高亮才能横向铺满对话框（整行高亮）。
+        insideMargin = DpSize(0.dp, DialogContentPadding),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                // 输入法弹出后可用高度变小，允许滚动以免底部按钮被裁切。
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AppTextField(
+                value = title,
+                onValueChange = { title = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = DialogContentPadding),
+                label = stringResource(R.string.field_title),
+                useLabelAsPlaceholder = true,
+                singleLine = true,
+            )
+            AppTextField(
+                value = content,
+                onValueChange = { content = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = DialogContentPadding),
+                label = stringResource(R.string.custom_test_content),
+                useLabelAsPlaceholder = true,
+                minLines = 2,
+                maxLines = 4,
+            )
+            // 两行紧贴，点按 / 悬停高亮覆盖整行。
+            Column(modifier = Modifier.fillMaxWidth()) {
+                SwitchPreference(
+                    checked = clearPrevious,
+                    onCheckedChange = { clearPrevious = it },
+                    title = stringResource(R.string.clear_previous_notification),
+                    summary = stringResource(R.string.clear_previous_notification_summary),
+                    insideMargin = SwitchRowMargin,
+                )
+                SwitchPreference(
+                    checked = enableFloat,
+                    onCheckedChange = { enableFloat = it },
+                    title = stringResource(R.string.auto_expand_notification),
+                    summary = stringResource(R.string.enable_float_summary),
+                    insideMargin = SwitchRowMargin,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = DialogContentPadding),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                AppActionTextButton(
+                    text = stringResource(R.string.close),
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f),
+                )
+                AppActionButton(
+                    onClick = { onSend(title, content, clearPrevious, enableFloat) },
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) {
+                    Text(stringResource(R.string.send_test_notification))
+                }
+            }
+        }
+    }
+}
+
+private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+private val DialogContentPadding = 24.dp
+private val SwitchRowMargin = PaddingValues(horizontal = DialogContentPadding, vertical = 14.dp)
+
+private const val DONATION_URL = "https://hyperisland.1812z.top/donors.html"
+private const val DOCUMENTATION_URL = "https://hyperisland.1812z.top/"
+private const val RESOURCES_URL = "https://hyperisland.1812z.top/downloads.html"
+private const val MIN_SUPPORTED_API = 101
+private const val REQUIRED_FOCUS_PROTOCOL = 3
+private const val ANDROID_15_SDK = 35
+private val ActiveColor = Color(0xFF36D167)
+private val ActiveBackground = Color(0xFFDFFAE4)
+private val InactiveColor = Color(0xFFFF5A52)
+private val InactiveBackground = Color(0xFFFFE5E3)
+private val WarningBackgroundLight = Color(0xFFFFF3D6)
+private val WarningContentLight = Color(0xFF704D00)
+private val WarningBackgroundDark = Color(0xFF3A2D12)
+private val WarningContentDark = Color(0xFFFFD978)

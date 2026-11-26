@@ -1,0 +1,178 @@
+package io.github.hyperisland.compose.page.apps
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import io.github.hyperisland.R
+import io.github.hyperisland.compose.component.AppCard
+import io.github.hyperisland.compose.component.DetailPage
+import io.github.hyperisland.compose.component.PageDropdownPreference
+import io.github.hyperisland.compose.component.ColorPaletteDialog
+import io.github.hyperisland.compose.component.SectionTitle
+import io.github.hyperisland.compose.component.parseHexColor
+import io.github.hyperisland.compose.component.toArgbHex
+import io.github.hyperisland.compose.data.FlutterPrefsRepository
+import io.github.hyperisland.compose.data.InstalledApp
+import io.github.hyperisland.compose.data.MediaNotificationSettings
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Refresh
+import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
+
+@Composable
+internal fun MediaNotificationPage(
+    app: InstalledApp,
+    prefs: FlutterPrefsRepository,
+    onBack: () -> Unit,
+) {
+    var draft by remember(app.packageName) {
+        mutableStateOf(prefs.mediaNotificationSettings(app.packageName))
+    }
+    var activeColorTarget by remember { mutableStateOf<ColorTarget?>(null) }
+    var selectedColor by remember { mutableStateOf(Color.Red) }
+    val defaults = prefs.defaultConfigSettings()
+    val modes = remember { listOf(TRI_STATE_DEFAULT, TRI_STATE_ON, TRI_STATE_OFF, TRI_STATE_FOLLOW_DYNAMIC) }
+    val outerGlowLabels = glowModeLabels(defaults.outerGlow)
+    val islandOuterGlowLabels = glowModeLabels(defaults.islandOuterGlow)
+
+    fun updateSettings(value: MediaNotificationSettings) {
+        draft = value
+        prefs.setMediaNotificationSettings(app.packageName, value)
+    }
+
+    DetailPage(
+        title = stringResource(R.string.media_notification),
+        onBack = onBack,
+        actionIcon = MiuixIcons.Refresh,
+        actionDescription = stringResource(R.string.restore_default),
+        onAction = { updateSettings(MediaNotificationSettings()) },
+    ) {
+        item {
+            SectionTitle(stringResource(R.string.media_notification))
+            AppCard {
+                SwitchPreference(
+                    checked = draft.enabled,
+                    onCheckedChange = { updateSettings(draft.copy(enabled = it)) },
+                    title = stringResource(R.string.media_notification),
+                    summary = stringResource(R.string.media_notification_disabled_summary),
+                    insideMargin = MEDIA_ITEM_MARGIN,
+                )
+                SwitchPreference(
+                    checked = draft.showIsland,
+                    onCheckedChange = {
+                        updateSettings(
+                            draft.copy(showIsland = it, normalNotification = if (it) false else draft.normalNotification),
+                        )
+                    },
+                    title = stringResource(R.string.media_show_island),
+                    summary = stringResource(R.string.media_show_island_summary),
+                    enabled = draft.enabled,
+                    insideMargin = MEDIA_ITEM_MARGIN,
+                )
+                SwitchPreference(
+                    checked = draft.normalNotification,
+                    onCheckedChange = {
+                        updateSettings(
+                            draft.copy(normalNotification = it, showIsland = if (it) false else draft.showIsland),
+                        )
+                    },
+                    title = stringResource(R.string.normal_notification),
+                    summary = stringResource(R.string.normal_notification_summary),
+                    enabled = draft.enabled,
+                    insideMargin = MEDIA_ITEM_MARGIN,
+                )
+            }
+        }
+        item {
+            SectionTitle(stringResource(R.string.outer_glow))
+            AppCard {
+                PageDropdownPreference(
+                    items = outerGlowLabels,
+                    selectedIndex = modes.indexOf(draft.outerGlow).coerceAtLeast(0),
+                    title = stringResource(R.string.focus_outer_glow),
+                    onSelectedIndexChange = { index -> updateSettings(draft.copy(outerGlow = modes[index])) },
+                    enabled = draft.enabled,
+                    insideMargin = MEDIA_ITEM_MARGIN,
+                )
+                AnimatedVisibility(visible = draft.enabled && draft.outerGlow == TRI_STATE_ON) {
+                    ArrowPreference(
+                        title = stringResource(R.string.out_effect_color),
+                        summary = draft.outEffectColor.takeIf(String::isNotEmpty),
+                        insideMargin = MEDIA_ITEM_MARGIN,
+                        onClick = {
+                            selectedColor = parseHexColor(draft.outEffectColor)
+                            activeColorTarget = ColorTarget.Focus
+                        },
+                    )
+                }
+                PageDropdownPreference(
+                    items = islandOuterGlowLabels,
+                    selectedIndex = modes.indexOf(draft.islandOuterGlow).coerceAtLeast(0),
+                    title = stringResource(R.string.island_outer_glow),
+                    onSelectedIndexChange = { index ->
+                        updateSettings(draft.copy(islandOuterGlow = modes[index]))
+                    },
+                    enabled = draft.enabled,
+                    insideMargin = MEDIA_ITEM_MARGIN,
+                )
+                AnimatedVisibility(visible = draft.enabled && draft.islandOuterGlow == TRI_STATE_ON) {
+                    ArrowPreference(
+                        title = stringResource(R.string.out_effect_color),
+                        summary = draft.islandOuterGlowColor.takeIf(String::isNotEmpty),
+                        insideMargin = MEDIA_ITEM_MARGIN,
+                        onClick = {
+                            selectedColor = parseHexColor(draft.islandOuterGlowColor)
+                            activeColorTarget = ColorTarget.Island
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    ColorPaletteDialog(
+        show = activeColorTarget != null,
+        title = stringResource(R.string.out_effect_color),
+        initialColor = selectedColor,
+        onDismiss = { activeColorTarget = null },
+        onDelete = {
+            when (activeColorTarget) {
+                ColorTarget.Focus -> updateSettings(draft.copy(outEffectColor = ""))
+                ColorTarget.Island -> updateSettings(draft.copy(islandOuterGlowColor = ""))
+                null -> Unit
+            }
+            activeColorTarget = null
+        },
+        onSave = { color ->
+            when (activeColorTarget) {
+                ColorTarget.Focus -> updateSettings(draft.copy(outEffectColor = color.toArgbHex()))
+                ColorTarget.Island -> updateSettings(draft.copy(islandOuterGlowColor = color.toArgbHex()))
+                null -> Unit
+            }
+            activeColorTarget = null
+        },
+    )
+}
+
+@Composable
+private fun glowModeLabels(defaultMode: String): List<String> = listOf(
+    defaultGlowLabel(defaultMode),
+    stringResource(R.string.enabled_option),
+    stringResource(R.string.disabled_option),
+    stringResource(R.string.follow_dynamic_color),
+)
+
+private val MEDIA_ITEM_MARGIN = PaddingValues(horizontal = 18.dp, vertical = 14.dp)
+private const val TRI_STATE_DEFAULT = "default"
+private const val TRI_STATE_ON = "on"
+private const val TRI_STATE_OFF = "off"
+private const val TRI_STATE_FOLLOW_DYNAMIC = "follow_dynamic"
+
+private enum class ColorTarget { Focus, Island }
