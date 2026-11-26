@@ -36,6 +36,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
     private var detailView: TextView? = null
     private var kindView: TextView? = null
     private var progressView: View? = null
+    private var actionsView: LinearLayout? = null
     private var layoutParams: WindowManager.LayoutParams? = null
     private var hideTask: Runnable? = null
     private var activeKey: String? = null
@@ -86,6 +87,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
         val progress: Int?,
         val progressMax: Int,
         val intent: PendingIntent?,
+        val actions: List<Notification.Action>,
     )
 
     private fun renderNotification(sbn: StatusBarNotification) {
@@ -136,6 +138,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
             progress = progress,
             progressMax = max,
             intent = n.contentIntent,
+            actions = n.actions?.toList().orEmpty().take(3),
         )
         main.post { show(sbn.key, content) }
     }
@@ -193,6 +196,11 @@ class Hos2IslandListenerService : NotificationListenerService() {
             maxLines = 2
             setLineSpacing(dp(1).toFloat(), 1f)
         }
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
         val progress = View(this).apply {
             background = GradientDrawable().apply {
                 cornerRadius = dp(2).toFloat()
@@ -209,6 +217,9 @@ class Hos2IslandListenerService : NotificationListenerService() {
             topMargin = dp(2)
         })
         container.addView(progress, LinearLayout.LayoutParams(dp(1), dp(3)).apply {
+            topMargin = dp(7)
+        })
+        container.addView(actions, LinearLayout.LayoutParams(-1, -2).apply {
             topMargin = dp(7)
         })
 
@@ -259,6 +270,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
             detailView = detail
             kindView = kind
             progressView = progress
+            actionsView = actions
             layoutParams = params
         }
     }
@@ -272,6 +284,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
         titleView?.text = content.title
         detailView?.text = content.detail
         detailView?.visibility = if (expanded || content.detail.isNotBlank()) View.VISIBLE else View.GONE
+        renderActions(content.actions)
         progressView?.let { bar ->
             val value = content.progress
             bar.visibility = if (value == null) View.GONE else View.VISIBLE
@@ -290,6 +303,35 @@ class Hos2IslandListenerService : NotificationListenerService() {
             hideTask = Runnable { dismiss() }
             main.postDelayed(hideTask!!, if (content.progress != null) 9000L else 5500L)
         }
+    }
+
+    private fun renderActions(actions: List<Notification.Action>) {
+        val row = actionsView ?: return
+        row.removeAllViews()
+        val usable = actions.filter { !it.title.isNullOrBlank() && it.actionIntent != null }
+        usable.forEachIndexed { index, action ->
+            val button = TextView(this).apply {
+                text = action.title.toString().take(18)
+                setTextColor(Color.WHITE)
+                textSize = 10f
+                typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(7), dp(10), dp(7))
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(38, 40, 46))
+                    cornerRadius = dp(14).toFloat()
+                    setStroke(dp(1), Color.argb(35, 255, 255, 255))
+                }
+                setOnClickListener {
+                    runCatching { action.actionIntent.send() }
+                    main.postDelayed({ dismiss() }, 1200L)
+                }
+            }
+            row.addView(button, LinearLayout.LayoutParams(-2, -2).apply {
+                if (index > 0) marginStart = dp(7)
+            })
+        }
+        row.visibility = if (usable.isEmpty()) View.GONE else View.VISIBLE
     }
 
     private fun toggleExpanded() {
@@ -337,6 +379,7 @@ class Hos2IslandListenerService : NotificationListenerService() {
         detailView = null
         kindView = null
         progressView = null
+        actionsView = null
         super.onDestroy()
     }
 
