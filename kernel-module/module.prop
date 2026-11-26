@@ -1,6 +1,6 @@
 id=hos3_visual_hybrid
-name=HOS3 Visual Hybrid (Sapphire)
-version=0.1.0
-versionCode=100
+name=HOS3 Visual Hybrid Diagnostics (Sapphire)
+version=0.1.1
+versionCode=101
 author=paypalinversioncamilo-art
-description=Systemless compatibility companion for Redmi Note 13 4G. Safe diagnostic base; no system partition or boot image changes.
+description=Optional diagnostic companion only; the visual engine is the Vector APK. No system partition or boot image changes.
