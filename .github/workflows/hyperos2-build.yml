@@ -12,7 +12,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
@@ -27,15 +26,11 @@ jobs:
         shell: bash
         run: |
           set -eu
-          echo "ANDROID_HOME=$ANDROID_HOME"
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -u+x 2>/dev/null | sort -V | tail -n 1)"
           if [ -z "$SDKMANAGER" ]; then
-            echo "::error::No se encontró sdkmanager dentro de $ANDROID_HOME/cmdline-tools"
-            find "$ANDROID_HOME" -maxdepth 4 -type f -name sdkmanager -print || true
+            echo "::error::No se encontró sdkmanager"
             exit 1
           fi
-          echo "SDKMANAGER=$SDKMANAGER"
-          # Android 37.2 se instala desde el paquete oficial: algunos cmdline-tools aún no indexan este minor API.
           yes | "$SDKMANAGER" --licenses || true
           "$SDKMANAGER" --install "build-tools;37.0.0" "ndk;28.2.13676358"
           PLATFORM_ZIP="$RUNNER_TEMP/platform-37.2_r01.zip"
@@ -45,18 +40,18 @@ jobs:
           unzip -q "$PLATFORM_ZIP" -d "$PLATFORM_TMP"
           PLATFORM_SOURCE="$(find "$PLATFORM_TMP" -type f -name source.properties -print -quit)"
           if [ -z "$PLATFORM_SOURCE" ]; then
-            echo "::error::El paquete oficial Android 37.2 no contiene source.properties"
+            echo "::error::El paquete Android 37.2 no contiene source.properties"
             exit 1
           fi
           PLATFORM_DIR="$(dirname "$PLATFORM_SOURCE")"
           cp -R "$PLATFORM_DIR/." "$ANDROID_HOME/platforms/android-37.2/"
-          grep -E "^(Pkg.Desc|Pkg.Revision|AndroidVersion.ApiLevel)=" "$ANDROID_HOME/platforms/android-37.2/source.properties"
           test -f "$ANDROID_HOME/platforms/android-37.2/android.jar"
 
       - name: Preparar Gradle
         run: chmod +x android/gradlew
 
       - name: Compilar APK
+        shell: bash
         run: |
           ./android/gradlew -p android --no-daemon :app:assembleReleaseFast \
             -PbuildTime="$(date -u '+%Y-%m-%d %H:%M UTC')" \
@@ -67,23 +62,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Archivos APK generados:"
-          find android -type f -name '*.apk' -print | sort
-          APK="$(find android -type f -name '*.apk' -print | sort | grep -E '/outputs/apk/[^/]+/[^/]+\.apk
-
-      - name: Guardar APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: HyperIsland-HyperOS2-APK
-          path: dist/HyperIsland-HyperOS2.apk
-          retention-days: 30
- | head -n 1 || true)"
+          echo "APK encontrados:"
+          find android -type f -name '*.apk' -print
+          APK="$(find android -type f -name '*.apk' -print -quit)"
           if [ -z "$APK" ]; then
-            echo "::error::Gradle terminó, pero no se encontró ningún APK dentro de android/"
+            echo "::error::Gradle terminó, pero no se encontró ningún APK"
             find android -type d -path '*/outputs/*' -print || true
             exit 1
           fi
-          echo "APK seleccionado: $APK"
           mkdir -p dist
           cp "$APK" dist/HyperIsland-HyperOS2.apk
           test -s dist/HyperIsland-HyperOS2.apk
@@ -94,4 +80,5 @@ jobs:
         with:
           name: HyperIsland-HyperOS2-APK
           path: dist/HyperIsland-HyperOS2.apk
+          if-no-files-found: error
           retention-days: 30
