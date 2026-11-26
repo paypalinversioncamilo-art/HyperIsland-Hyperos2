@@ -3,7 +3,7 @@ name: HyperIsland HyperOS 2 APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master, 'hos2/**']
+    branches: [main, master, 'hos2/**', 'hos3/**']
 
 permissions:
   contents: read
