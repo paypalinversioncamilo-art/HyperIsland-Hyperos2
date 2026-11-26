@@ -26,7 +26,7 @@ jobs:
       - name: Configurar Android SDK
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
           echo "ANDROID_HOME=$ANDROID_HOME"
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -u+x 2>/dev/null | sort -V | tail -n 1)"
           if [ -z "$SDKMANAGER" ]; then
