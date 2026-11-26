@@ -1273,4 +1273,5 @@
     <string name="debug_burn_in_direction_up">up</string>
     <string name="debug_burn_in_direction_right">right</string>
     <string name="debug_burn_in_direction_down">down</string>
+    <string name="hos2_fallback_title">HyperOS 2 compatibility mode</string>
 </resources>
