@@ -69,6 +69,7 @@ import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModule
 import io.github.hyperisland.xposed.utils.HookUtils
 import io.github.hyperisland.xposed.diagnostics.IslandPerformanceMonitor
+import io.github.hyperisland.xposed.compat.HyperOS2CompatibilityProbe
 
 /**
  * 模块主入口，继承 XposedModule。
@@ -85,6 +86,7 @@ class HyperIslandModule : XposedModule() {
         when (param.packageName) {
             "com.android.systemui" -> {
                 IslandPerformanceMonitor.init(this, param)
+                HyperOS2CompatibilityProbe.inspect(this, param.defaultClassLoader, "systemui-package")
                 HookUtils.initializeLoaderDiagnostics(this, param.defaultClassLoader)
                 if (ConfigManager.getBoolean("pref_face_unlock_island", false)) {
                     FaceUnlockStateHook.init(this, param)
@@ -176,8 +178,10 @@ class HyperIslandModule : XposedModule() {
                 HomeAssistantIslandHook.init(this, param)
             }
 
-            "miui.systemui.plugin" ->
+            "miui.systemui.plugin" -> {
+                HyperOS2CompatibilityProbe.inspect(this, param.defaultClassLoader, "plugin-package")
                 HookUtils.discoverPluginLoader(this, param.defaultClassLoader)
+            }
 
             "com.android.providers.downloads" ->
                 DownloadHook.init(this, param)
