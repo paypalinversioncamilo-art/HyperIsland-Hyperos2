@@ -1,0 +1,40 @@
+name: HOS3 Visual Hybrid module
+on:
+  workflow_dispatch:
+  push:
+    branches: ['hos3/**']
+    paths:
+      - 'kernel-module/**'
+      - '.github/workflows/hos3-visual-hybrid.yml'
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate safe module scaffold
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f kernel-module/module.prop
+          test -f kernel-module/skip_mount
+          test -f kernel-module/service.sh
+          grep -q '^id=hos3_visual_hybrid$' kernel-module/module.prop
+          grep -q 'SAFE_NO_SYSTEM_MOUNT' kernel-module/service.sh
+          test ! -d kernel-module/system
+          bash -n kernel-module/service.sh
+      - name: Package KernelSU-style ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          (cd kernel-module && zip -qr ../dist/HOS3-Visual-Hybrid-Sapphire-v0.1.0.zip .)
+          unzip -t dist/HOS3-Visual-Hybrid-Sapphire-v0.1.0.zip
+          unzip -l dist/HOS3-Visual-Hybrid-Sapphire-v0.1.0.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HOS3-Visual-Hybrid-Sapphire
+          path: dist/HOS3-Visual-Hybrid-Sapphire-v0.1.0.zip
+          if-no-files-found: error
+          retention-days: 30
