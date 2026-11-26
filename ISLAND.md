@@ -1,0 +1,1016 @@
+# HyperOS 超级岛图层与 View 结构
+
+本文记录 HyperIsland 开发过程中通过 SystemUI JADX、实机日志和当前 Hook 代码确认的超级岛 View 层级、状态映射、背景渲染、焦点通知和 fake 过渡层行为。
+
+文档重点是区分两条渲染路径：
+
+- 稳定状态由真实内容 View 绘制。
+- 状态切换、窗口动画和部分手势动画由 `DynamicIslandContentFakeView` 绘制。
+
+如果只修改真实 View，稳定状态可能正确，但缩放和移动动画仍会出现黑块、错位或模糊突然消失。
+
+## 柔光插件加载器兼容性排查
+
+其他模块使用 `createPackageContext("miui.systemui.plugin", CONTEXT_INCLUDE_CODE)` 时，可能触发一套独立插件加载器。`Class.forName` 能找到超级岛类并不代表其方法签名所需的 `DynamicIslandData` 等依赖已就绪。柔光 Hook 在绑定运行时前先解析关键类的方法签名；验证失败不修改已有绑定。运行时按实际内容 Class 隔离，不再拒绝所有后续加载器，也不以新绑定覆盖旧绑定。具体 View 通过内容祖先或 `updateBackgroundBg` 来源选择所属运行时；材质 token、兼容方法及 Bionics 能力查询均使用该绑定。此修复针对组件更新后 `runtime rejected foreign binding` 导致新运行时漏装，材质及采样效果仍需实机验证。
+
+复现顺序：高德导航正常上岛 → 熄屏亮屏 → 锁屏底部导航岛显示 → 观察解锁岛 → 解锁 → 地图岛展开收起。导出覆盖整个过程的 LSPosed 模块日志，关注 `HyperIsland[SoftGlass]` 的 `runtime bound`、`runtime rejected foreign binding` 和 `trace`，以及 `IslandBlurHook` 的 `loader-validation` 错误。`trace` 每个 SystemUI 进程最多记录 160 条，包含材质提交/缓存命中、窗口及穿窗模糊请求和本模块的采样持有记录；这些记录不等价于原生采样器实际状态。
+
+## 1. 关键类
+
+| 用途 | 类 |
+| --- | --- |
+| 岛内容基类 | `miui.systemui.dynamicisland.window.content.DynamicIslandBaseContentView` |
+| 正常内容实例 | `miui.systemui.dynamicisland.window.content.DynamicIslandContentView` |
+| 动画替身实例 | `miui.systemui.dynamicisland.window.content.DynamicIslandContentFakeView` |
+| 外层岛背景 | `miui.systemui.dynamicisland.DynamicIslandBackgroundView` |
+| 大岛内容 | `miui.systemui.dynamicisland.view.DynamicIslandBigIslandView` |
+| 焦点/展开内容 | `miui.systemui.dynamicisland.view.DynamicIslandExpandedView` |
+| 动画控制 | `miui.systemui.dynamicisland.anim.DynamicIslandAnimationDelegate` |
+| 事件和窗口动画协调 | `miui.systemui.dynamicisland.event.DynamicIslandEventCoordinator` |
+| 岛状态 | `miui.systemui.dynamicisland.event.DynamicIslandState` |
+| 模糊兼容层 | `miui.systemui.util.MiBlurCompat` 或 `miui.util.MiBlurCompat` |
+| 原生实时背景模糊 | `com.android.internal.graphics.drawable.BackgroundBlurDrawable` |
+
+## 2. 稳定状态 View 层级
+
+根据 `DynamicIslandViewBinding`、`DynamicIslandBaseContentView` 字段和实机 View 日志，核心层级可抽象为：
+
+```text
+DynamicIslandBackgroundView (id=island_container)
+└── DynamicIslandContentView (id=island_content)
+    ├── FrameLayout (id=container)
+    ├── FrameLayout (id=small_island_view)
+    ├── DynamicIslandBigIslandView (id=big_island_view)
+    ├── ViewStub (expandedViewStub)
+    └── DynamicIslandExpandedView (id=expanded_view, ViewStub inflate 后存在)
+```
+
+### 2.1 各层职责
+
+| View | 状态 | 职责 |
+| --- | --- | --- |
+| `small_island_view` | `SMALL` | 小岛稳定状态内容和背景宿主 |
+| `big_island_view` | `BIG` | 大岛稳定状态内容和背景宿主 |
+| `expanded_view` | `EXPAND` | 焦点通知、展开卡片的真实内容和背景宿主 |
+| `container` | 共享 | 内容布局容器，不应直接当作某一种状态的唯一背景目标 |
+| `island_container` | 共享 | 绘制系统外层岛轮廓、黑色背景或自定义背景 |
+
+### 2.2 焦点通知
+
+本文中的焦点通知对应 `EXPAND` 状态，真实背景目标是：
+
+```text
+DynamicIslandExpandedView (id=expanded_view)
+```
+
+它不是：
+
+- `DynamicIslandBackgroundView`
+- `container`
+- `fake_expanded_view`
+- `expandedViewStub`
+
+`expanded_view` 可能在 ViewStub inflate 后才存在。它也可能在状态已经回到 `BIG` 时被 SystemUI 再次测量或布局，因此不能只根据 View 类名判断它当前是否应该启用焦点模糊，还要检查所属 `DynamicIslandContentView.state`。
+
+需要区分“形状/遮罩参考 View”和“最终外层 Drawable 宿主”：
+
+- `expanded_view` 是焦点稳定态的真实内容 View，也是类型和圆角参考。
+- HyperIsland 自定义焦点图片最终写入 `DynamicIslandBackgroundView.drawable`，不写入 `expanded_view`。
+- HyperIsland 焦点 BlurDrawable 也最终写入同一个 `DynamicIslandBackgroundView.drawable`，不写入 `expanded_view`。
+- 图片和模糊共享同一个外层 Drawable 槽位，因此同一类型按设计互斥；存在自定义焦点背景时不会创建焦点 BlurDrawable。
+
+实机曾观察到：
+
+```text
+view=DynamicIslandExpandedView(expanded_view)
+type=EXPAND
+state=BIG
+size=1001x115
+```
+
+这种调用属于过渡或陈旧更新，不应重新激活稳定状态的焦点 BlurDrawable。
+
+## 3. 状态映射
+
+当前主要状态映射如下：
+
+| `DynamicIslandState` 子类 | HyperIsland 类型 |
+| --- | --- |
+| `SmallIsland` | `SMALL` |
+| `BigIsland` | `BIG` |
+| `ShowOnceBigIsland` | `BIG` |
+| `Expanded` | `EXPAND` |
+| `AppExpanded` | `EXPAND` |
+| `MiniWindowExpanded` | `EXPAND` |
+| `SubAppExpanded` | `EXPAND` |
+| `SubMiniWindowExpanded` | `EXPAND` |
+
+主要状态识别入口是：
+
+```java
+DynamicIslandBaseContentView.updateDarkLightMode(
+    DynamicIslandState state,
+    String source,
+    boolean arg1,
+    boolean arg2
+)
+```
+
+注意：状态字段、真实 View 可见性和动画 View 可见性在过渡期间可能短暂不同步。状态只表示目标或逻辑状态，不一定表示当前屏幕上正在绘制的 View。
+
+## 4. fake 动画层
+
+### 4.1 层级
+
+`DynamicIslandContentFakeView` 使用 `dynamic_island_fake_view` 布局，其绑定类是 `DynamicIslandFakeViewBinding`。核心结构为：
+
+```text
+DynamicIslandContentFakeView / fake_container
+├── FrameLayout (id=fake_small_island_view)
+├── FrameLayout (id=fake_big_island_view)
+├── FrameLayout (id=fake_expanded_view)
+├── View (id=fake_island_mask)
+└── View (id=mini_window_bar)
+```
+
+对应 `DynamicIslandBaseContentView` 字段：
+
+```text
+fakeView
+fakeContainer
+fakeSmallIsland
+fakeBigIsland
+fakeExpandedView
+fakeMask
+miniBar
+```
+
+### 4.2 fake View 不是无用占位符
+
+`DynamicIslandContentFakeView` 是 SystemUI 的实际动画载体，承担：
+
+- 小岛、大岛、展开态之间的窗口动画。
+- 应用开关动画。
+- 自由窗和 Mini Window 动画。
+- 连续位置、宽高、缩放和透明度变化。
+- 动态圆角 Outline 更新。
+- 真实 View 与 fake View 的可见性交接。
+
+因此不能简单删除整个 fake View，也不建议永久设置为 `GONE`。
+
+`DynamicIslandContentFakeView.setVisibility(int)` 包含额外副作用，包括：
+
+- 恢复真实内容 View。
+- 恢复 `DynamicIslandBackgroundView`。
+- 同步 Lottie 进度。
+- 更新窗口动画运行状态。
+- 结束动画生命周期延长。
+
+直接修改整个 fake View 的可见性可能破坏 SystemUI 动画状态机。
+
+### 4.3 动画期间真实 View 会被隐藏
+
+在 `onTrackingFakeViewStart()` 中，SystemUI 会执行等价逻辑：
+
+```text
+fakeView.visibility = VISIBLE
+fakeView.alpha = 1
+realView.visibility = INVISIBLE
+realView.backgroundView.visibility = INVISIBLE
+```
+
+这意味着动画期间：
+
+- 真实 `small_island_view`、`big_island_view`、`expanded_view` 上的 BlurDrawable 不负责屏幕上的连续形变。
+- 只更新真实 View 的 Drawable bounds 无法解决动画缩放。
+- 过渡模糊必须依附 SystemUI 正在动画的 fake 层。
+
+### 4.4 fake 展开容器
+
+`DynamicIslandContentFakeView.onFinishInflate()` 会执行：
+
+```java
+setFakeExpandedView(findViewById(fake_expanded_view));
+updateBackgroundBg(fakeExpandedView, false);
+```
+
+`updateExpandedView()` 会把数据提供的临时 View 放进 `fake_expanded_view`：
+
+```text
+fakeExpandedView.removeAllViews()
+fakeExpandedView.addView(dynamicIslandData.fakeView)
+```
+
+因此 `fake_expanded_view` 是过渡期展开/焦点内容和背景的实际宿主，不是普通的稳定状态 `expanded_view`。
+
+这里的“背景宿主”需要区分稳定态和过渡态。SystemUI 会通过 `updateBackgroundBg(fakeExpandedView, ...)` 设置内层 stock background、MiBlur 和 BlendColor；HyperIsland 的过渡 Hook 还会在对应 fake 子 View 上安装独立的过渡 BlurDrawable 或自定义背景：
+
+```text
+稳定态自定义焦点背景 -> DynamicIslandBackgroundView.drawable
+稳定态焦点实时模糊   -> DynamicIslandBackgroundView.drawable
+过渡态焦点实时模糊   -> fake_expanded_view.background
+过渡态焦点自定义背景 -> fake_expanded_view.background
+过渡态系统共享遮罩   -> fake root / fakeContainer / fakeMask
+```
+
+`onTrackingFakeViewStart()` 会隐藏真实 `DynamicIslandBackgroundView` 和真实内容 View，动画结束后再交回真实层。因此过渡视觉必须显式安装到 `fake_small_island_view`、`fake_big_island_view`、`fake_expanded_view`，不能假设隐藏的稳定态 `DynamicIslandBackgroundView.drawable` 仍在屏幕上绘制。
+
+每个 fake 子 View 保存自己的系统原始 background。对应类型启用模糊时，`IslandBlurHook.applyTransitionBlur()` 在该子 View 上创建独立的 `BackgroundBlurDrawable`；关闭模糊或 View detach 时恢复原 background 并释放模糊资源。自定义图片由 `IslandBackgroundHook.createTransitionBackground()` 创建独立 Drawable 实例，避免多个 View 共享 bounds。
+
+## 5. fake 层几何和圆角
+
+### 5.1 连续几何更新
+
+手势和动画期间，`onTrackingFakeViewUpdate(float)` 会更新：
+
+```text
+alpha
+left
+right
+top
+bottom
+```
+
+更新后调用 `onFakeViewTrackingParamsUpdated()`，再调用：
+
+```java
+updateOutline(height, width, false)
+```
+
+### 5.2 动态 Outline
+
+`DynamicIslandContentFakeView.updateOutline()` 会：
+
+- 根据动画高度和宽度计算圆角矩形。
+- 设置 `ViewOutlineProvider`。
+- 调用 `setClipToOutline(true)`。
+- 更新 `fake_expanded_view` 的模糊 Outline。
+- 更新 Mini Window bar 的位置。
+
+系统使用的轮廓类似：
+
+```java
+outline.setRoundRect(left, top, right, bottom, radius);
+```
+
+因此 fake 层能够连续缩放和裁剪，而真实 View 的宽高可能只在动画结束时发生离散切换。
+
+### 5.3 `updateExpandViewBlur()`
+
+`DynamicIslandContentFakeView.updateExpandViewBlur(int, boolean, boolean)` 会给 `fake_expanded_view` 设置专用 OutlineProvider，并根据动画阶段修改 RenderNode 位置及圆角矩形。
+
+fake 层负责内容动画和 Outline。稳定态模糊继续复用 `DynamicIslandBackgroundView` 的 `actual*` 参数；过渡态模糊则安装在当前 fake 子 View 上，并跟随该 View 的系统缩放、裁剪和 Outline。两条管线不能混为同一个 Drawable 宿主。
+
+## 6. 系统背景渲染
+
+### 6.1 `DynamicIslandBackgroundView`
+
+共享外层背景由：
+
+```text
+DynamicIslandBackgroundView (id=island_container)
+```
+
+负责。它持有和使用的关键成员包括：
+
+```text
+drawable
+backgroundAlpha
+stokeWidth
+scheduleUpdate()
+alphaAnimation(float)
+onDraw(Canvas)
+setDrawable(Drawable)
+```
+
+该层适合：
+
+- 系统稳定状态外层黑色岛轮廓。
+- 自定义图片或 GIF 背景。
+- 当前实时模糊 `BackgroundBlurDrawable`。
+
+`onDraw()` 每帧执行等价逻辑：
+
+```java
+drawable.setBounds(
+    actualLeft - stokeWidth,
+    actualTop - stokeWidth,
+    actualWidth + stokeWidth,
+    actualHeight + stokeWidth
+);
+drawable.draw(canvas);
+```
+
+`actualLeft`、`actualTop`、`actualWidth` 和 `actualHeight` 由 `containerScheduleUpdate()` 根据系统动画更新。因此把 BlurDrawable 放在这个 `drawable` 字段中，可以直接跟随单岛、双岛、缩放、位移和消失动画，无需自行推算坐标。
+
+### 6.2 `updateBackgroundBg(View, boolean)`
+
+稳定 View 和 `fake_expanded_view` 都会经过：
+
+```java
+DynamicIslandBaseContentView.updateBackgroundBg(View view, boolean promoted)
+```
+
+系统行为分为两条路径。
+
+背景模糊不可用或 View 没有 parent 时：
+
+```text
+setMiViewBlurModeCompat(view, 0)
+clearMiBackgroundBlendColorCompat(view)
+view.background = dynamic_island_background 或 dynamic_island_liveupdate_background
+```
+
+背景模糊可用时：
+
+```text
+setMiViewBlurModeCompat(view, 1)
+clearMiBackgroundBlendColorCompat(view)
+setMiBackgroundBlendColors(...)
+view.background = null
+```
+
+系统默认 BlendColor 会形成深色或黑色视觉层。只清空 `background` 不足以移除黑色效果，还要区分：
+
+- View background Drawable。
+- MiBlur mode。
+- MiBlur BlendColor。
+- `DynamicIslandBackgroundView` 的外层 Drawable。
+- `fake_island_mask`。
+
+## 7. 模糊渲染策略
+
+### 7.1 当前实现
+
+稳定状态下，三种状态共用每个岛实例自己的动态背景宿主，但按当前状态独立更新配置：
+
+| 状态 | 形状参考 | BlurDrawable 宿主 |
+| --- | --- | --- |
+| `SMALL` | `small_island_view` | `DynamicIslandBackgroundView.drawable` |
+| `BIG` | `big_island_view` | `DynamicIslandBackgroundView.drawable` |
+| `EXPAND` | `expanded_view` | `DynamicIslandBackgroundView.drawable` |
+
+创建流程：
+
+```text
+DynamicIslandBackgroundView.getViewRootImpl()
+ViewRootImpl.createBackgroundBlurDrawable()
+BackgroundBlurDrawable.setBlurRadius(radius)
+BackgroundBlurDrawable.setCornerRadius(tl, tr, br, bl)
+BackgroundBlurDrawable.setColor(argb)
+DynamicIslandBackgroundView.drawable = drawable
+DynamicIslandBackgroundView.onDraw() 动态设置 bounds 并绘制
+```
+
+配置仍按 `SMALL`、`BIG`、`EXPAND` 独立保存。状态切换时旧 BlurDrawable 半径归零、callback 断开，再创建或更新当前类型 Drawable。
+
+### 7.2 过渡状态
+
+过渡期间真实内容 View 和真实 `DynamicIslandBackgroundView` 可能被隐藏，屏幕上的主要动画载体是 `DynamicIslandContentFakeView`。当前实现因此使用两套宿主：
+
+```text
+稳定状态：DynamicIslandBackgroundView.drawable + BackgroundBlurDrawable
+过渡状态：当前 fake 子 View.background + 独立 BackgroundBlurDrawable
+稳定几何：DynamicIslandBackgroundView actualLeft/Top/Width/Height
+过渡几何：fake 子 View 的 layout/scale/translation/Outline
+```
+
+`IslandBlurHook` 在以下入口刷新 fake 子 View：
+
+```text
+DynamicIslandAnimationDelegate.updateFakeViewAnimState()
+DynamicIslandAnimationDelegate.containerScheduleUpdate()
+DynamicIslandContentFakeView.onFinishInflate()
+DynamicIslandContentFakeView.setVisibility(VISIBLE)
+```
+
+三种过渡模糊互相独立：
+
+| fake 子 View | 配置 |
+| --- | --- |
+| `fake_small_island_view` | `pref_island_blur_small_enabled` |
+| `fake_big_island_view` | `pref_island_blur_big_enabled` |
+| `fake_expanded_view` | `pref_island_blur_expand_enabled` |
+
+不推荐：
+
+- 删除 `DynamicIslandContentFakeView`。
+- 永久隐藏 `fake_expanded_view`。
+- 把 fake View 当作普通 `EXPAND` 稳定目标。
+- 仅在真实 View 上逐帧修改 Drawable bounds 来模拟窗口动画。
+- 在稳定态普通内容子 View 中插入 BlurDrawable。稳定态应使用外层 `DynamicIslandBackgroundView.drawable`；fake 子 View 是过渡动画载体，由过渡 Hook 专门管理，不属于该禁用范围。
+- 在内容 View 外部创建 overlay 并手工追踪坐标。双岛和 Folme 动画下容易错位。
+- 使用 `MiBackgroundBlurMode` 直接替代 BlurDrawable。当前设备上只得到灰色混色层，没有有效背景采样。
+
+### 7.3 fake 层共享黑色遮罩
+
+`fake_small_island_view`、`fake_big_island_view`、`fake_expanded_view` 是按状态独立的内容层，但 fake root、`fakeContainer` 和 `fake_island_mask` 是三态共享层。共享层不能按“任意一种模糊已开启”统一清除，也不能永久保留：
+
+- 永久清除：未开启模糊的小岛或大岛会在飞行动画中透明。
+- 永久保留：已开启模糊的大岛或焦点通知下面会一直跟随黑色遮罩。
+- 只看 `SMALL` 配置：仅开启大岛/焦点模糊时，过渡模糊会被共享黑罩盖住。
+- 只看逻辑 `state`：交叉动画期间逻辑状态和当前实际绘制子 View 可能不同步。
+
+正确策略是识别当前实际渲染的 fake 子 View，再读取该类型自己的模糊配置：
+
+```text
+候选条件：visibility == VISIBLE && alpha > 0
+单一候选：直接使用该类型
+多个候选：优先 alpha 最大者
+alpha 相同：使用 fake view 逻辑 state 消歧
+无候选：回退逻辑 state
+```
+
+随后仅对当前渲染类型决定共享遮罩：
+
+```text
+当前渲染类型模糊开启 -> 清除 fake root / fakeContainer / fakeMask background
+当前渲染类型模糊关闭 -> 恢复三者保存的系统原始 background
+```
+
+这使三态组合都能独立工作：
+
+| SMALL | BIG | EXPAND | 当前渲染态行为 |
+| --- | --- | --- | --- |
+| 关 | 关 | 关 | 三态均保留系统黑罩 |
+| 开 | 关 | 关 | 仅 fake small 清共享黑罩 |
+| 关 | 开 | 关 | 仅 fake big 清共享黑罩 |
+| 关 | 关 | 开 | 仅 fake expanded 清共享黑罩 |
+| 任意组合 | 任意组合 | 任意组合 | 每帧只服从当前实际渲染类型 |
+
+三种模糊全部关闭时仍不得修改 fake 子 View 或共享遮罩；自定义图片的过渡背景继续按类型独立处理。
+
+### 7.4 fake 到真实岛的背景 alpha 交接
+
+实机末帧日志确认，出现“飞行动画正常，到达后透明一下，再渐显黑罩”时，fake 层本身并未透明。隐藏前的观测为：
+
+```text
+root visibility=VISIBLE alpha=1
+fakeBigIsland visibility=VISIBLE alpha=1 background=GradientDrawable
+setVisibility(INVISIBLE) 后 fake root 才消失
+```
+
+因此透明空档发生在 fake root 隐藏后、真实背景完成接管前。根因是真实 `DynamicIslandBackgroundView.backgroundAlpha` 仍由 `alphaAnimation(float)` 从低值执行 Folme 渐显，而不是 fake mask 在末帧消失。
+
+`IslandTransitionVisualHook` 在 fake 动画期间跟踪对应真实 `DynamicIslandBackgroundView`：
+
+- 真实当前类型未开启模糊：交接期间拦截该背景实例的 `alphaAnimation()`，固定 `backgroundAlpha=1` 并调用 `scheduleUpdate()`。
+- 真实当前类型已开启模糊：立即解除该实例的黑罩 alpha 拦截，避免焦点/大岛模糊被不透明背景挡住。
+- fake view 切换为 `INVISIBLE` 前再次把未模糊真实背景设为不透明，随后在下一主线程任务移除临时标记。
+
+这项处理只修复真实背景的接管空档，不替代 fake 三态共享遮罩判断。
+
+`DynamicIslandBackgroundView.onDraw()` 也不能在当前实例没有 active `OuterBlur` 时被跳过。外层系统纯黑 Drawable 正是由该方法绘制；跳过后只剩内层 MiBlur/BlendColor，视觉上会成为灰色岛。inactive 实例必须始终执行原始 `onDraw()`，只有 active 实例需要先把 `drawable` 字段纠正为对应 BlurDrawable。
+
+### 7.5 SoftGlass 生命周期
+
+「柔光场景亮度」复用 `StatusBarTextColorHook` 的 readable tint 监听：开关启用且文字为黑色时，临时覆盖 Bionics 参数 23（`reflectionLighten`），默认调节值 -28；白字或关闭开关时恢复各状态的手动值。配置不回写材质 JSON。状态切换仅为 `SoftGlassController.appliedConfigs` 中已附着的真实/fake 槽重新提交 shader 参数，不调用 `apply()`，避免取消正在退场的材质租约或重建采样生命周期。
+
+实机补充：在没有其他柔光的应用界面容易发白，显示音量条、展开状态栏或回到有柔光的桌面后恢复。这支持共享采样冷启动异常的假设，不能据此判定系统拒绝渲染。上一轮放行原生 EXPAND 共享黑罩的尝试无效并出现遮罩重叠，已撤回。
+
+1px 常规模糊半径冷启动尝试经实机反馈无效，已删除；只读采样诊断保留。
+
+2026-11-18 直接通过 ADB 对照：用户确认焦点展开且发白后保存窗口、SurfaceFlinger 与原始 logcat；用户只按一次音量键并确认立即恢复，再保存同类快照。两次超级岛均为 `VRI-DynamicIslandWindow#8823`、`1080×2400`。发白前 `15:47:45.869` 的 `checkSurTexSize` 已请求 `270×600`，随后 RenderThread 仍打印 `cropRB:270 35`；发白快照中该进程的 passBlur 缓冲区只有 `270×35`。`15:49:27.871` 音量窗口记录 `mMiBlurUsed:true`，`15:49:27.876` 请求 `270×600`，之后出现新的大尺寸 passBlur 缓冲区。此证据支持目标尺寸更新后生产端未及时提供新缓冲区的排查方向，但不能把音量窗口的新纹理直接当成超级岛已切换纹理的证明。`mBgChanged:0` 不能单独证明停止采样；收起 BIG 时的 mode=0 也不能证明 EXPAND 被关闭。
+
+100ms 有限强制刷新经实机反馈仍无效，已撤销刷新调用与窗口监听。进一步通过 `cmd window dump-visible-window-views` 导出并按手机实际 `ViewHierarchyEncoder` 格式解码：发白与用户只按一次音量键恢复后的 383 个相同 View，全部导出的 `blur:*` 字段一致；可见 EXPAND 已为 view mode=1、material type=1，根窗口 pass=true、background mode=1、柔光半径35/350。该对照不涵盖未导出的 shader 数组及 GPU 内部状态，不能据此宣称根因已完全定位。
+
+通过本机 framework 与 libhwui 核查，系统支持 `dumpsys gfxinfo com.android.systemui blur_blend 1/0` 临时开启/关闭 Java 与 native 模糊日志，无需编译模块。采集前 blur_blend=false，采集后已恢复 false；不改持久系统属性。3秒发白连续采样中，VRI 的期望纹理尺寸为270×600、SurfaceTexture标识稳定，而渲染侧仍报告270×35，未观察到新的 setTextureAvailable 通知。后续连续记录中用户报告通知自动消失后重新展开恢复，且日志出现 NotificationShade，因此这段不能当作第二次“只按音量键”的对照。
+
+已确认一处模块与原生的开启时序冲突：模块为稳定 SOFT 保留 pass blur 时，把 native false 改为 true；原生下一次 true 因 `lastPassWindowBlurEnabled=true` 被缓存吞掉，随后记账却把通道交给原生。当前改为仅在 `requested=true && retainedPassBlurRoots.contains(root) && !systemPassBlurRoots.contains(root)` 时，先通过同一个原生入口发送 false 归还模块保留的租约，再执行系统本来的 true。内部关闭使用 samplerWrite 跳过本模块的 keep-alive 拦截，其他纹理使用者继续由 ViewRootImpl 原生引用登记保护；关闭调用失败仍执行原开启。不对原生已持有的通道重复关开，不加定时器，不修改材质参数或遮罩。这是交接时的租约归还，不能扩展成逐帧或事后重建任意系统采样器；是否消除发白仍待实机验证。
+
+性能采集 `sampling-state` 保留窗口原生 mode/radius/pass 状态，并增加 ViewRootImpl 的期望纹理尺寸、mMiBlurUsed、纹理可见性及 SF 状态。期望尺寸不代表生产端已产出同尺寸像素；未知字段记 null。`pass-ownership-return` 记录归还调用，调用成功不等于 GPU 已恢复。采集期间观察其他窗口开启模糊的请求，停止采集即卸载临时观察 Hook。
+
+本次 JADX MCP 打开的组件版本为 `18.2.2.2.0`。再次核查下拉取消：`onTrackingFakeViewEnd()` 的 Folme 复位结束后进入 `updateExpandedFakeViewToReal()`，内部先 `fake.setVisibility(INVISIBLE)`，再 `real.setVisibility(VISIBLE)` 和显示真实背景。普通窗口动画的 `setVisibility()` 交接不能覆盖这个顺序。模块在整个原生复位调用期间保留 fake 材质，方法返回后提交真实材质和采样，再释放 fake；不改系统可见性与结束回调。下拉开始同时重新标记 EXPAND，避免上轮 Hidden 槽选择遗留。
+
+普通焦点收起时，`IslandPropertyUpdater.updateExpanded()` 仍按动画参数更新展开槽的 alpha/scale/translation，逻辑状态切换并不代表该槽已停止绘制。旧材质改为在真实槽与祖先不可见或 alpha 接近零后的 pre-draw 中释放；新状态重新接管会撤销待释放操作。清理监听持有弱引用，最多 128 个，detach 或 3 秒兜底清理，防止取消动画遗留采样租约。该修复已针对原生调用顺序实现，仍须实机验证下拉取消、正常收起、快速反复展开收起及不同材质组合。
+
+应用窗口退回小岛时，`FakeViewAnimHelper.animToFakeSmallIslandView()` 可在 Folme `onBegin` 才显示 SMALL 子槽。JADX MCP 核查 `18.3.2.5.0` 后，材质在 fake 的原生 alpha 写入后检查实际槽位。交叉淡入期间保留当前绘制的柔光，目标子槽可见且 alpha 达到旧槽后先提交目标，再释放旧材质。`fakeViewToHidden/Deleted` 清除 fake 材质选择，空槽期间不回填模块缓存的遮罩。真实层在 fake 隐藏后按已显示的真实槽提交，`AppExpanded` / `MiniWindowExpanded` 不作为真实展开槽。原生开启采样和模块为柔光保留采样分别记录，最后一个柔光槽退出时只关闭模块持有的采样。该修复尚待实机验证。
+
+SoftGlass 的 renderer 是系统 Bionics，但真实态和动画态不是同一个 View 生命周期。`DynamicIslandWindowView` 分别创建 `DynamicIslandContentView`（稳定真实内容）与 `DynamicIslandContentFakeView`（过渡动画内容），再由 `handleInitState(real, fake, params)` 建立关联。两者继承同一基类并可复用 `updateBackgroundBg(View, promoted)` 入口，只代表“材质写入 API 相同”，不代表 View 实例、创建时机、可见性或释放时机统一。
+
+已由 JADX 确认的关键顺序：
+
+1. 真实 View 与 fake View 分别 inflate/build；fake 内部的 SMALL/BIG/EXPAND 是长期复用的三个槽位。
+2. 动画目的槽由 `FakeViewAnimator.fakeViewToSmallIsland/BigIsland/Expanded` 决定；不能仅用 fake 子 View 的 `VISIBLE` 判断，因为非目标槽可能仍保持可见属性。
+3. `updateBackgroundBg()` 只有在 `getBackgroundMaterialOpened(context)=true` 且目标已有 parent 时才进入 Bionics 分支，并同步执行 `setMiViewBlurModeCompat(1)`、`setMiViewMaterialType(1)`、`setMiGlass(params)`、`background=null`。目标尚未 attach 时调用该入口会走非材质分支，并在手机上写入黑色 `dynamic_island_background`。
+4. `updateExpandedView()` 会在 ContentView 仍处于 BIG/SMALL 时预先准备隐藏 EXPAND；这次调用是结构初始化，不等于 EXPAND 已取得渲染所有权。
+5. 稳定态切换和 fake 动画结束是两套交接；只修改真实岛会漏掉动画，只修改 fake 又会在交接后恢复系统稳定态背景。
+
+Bionics 目标之外还有互相独立的背景写入者：
+
+- `DynamicIslandBackgroundView.drawable`：系统外层岛轮廓/背景。
+- `container` 与 `island_mask`：真实 ContentView 的共享层。OS4 `IslandPropertyUpdater.updateContainer()` 会逐帧写回黑色 Drawable；Expanded Bionics 还缓存 `bionicsExpandedBackground` 并随动画修改 alpha。
+- fake root、`fake_container`、`fake_mask`：fake 三态共享层；`restoreFakeViewBackground()` 在 Bionics active 时会给 fake root 和 container 写黑色 Drawable。
+- 真实与 fake 子槽的 self blur：分别由 `IslandPropertyUpdater` 和 `FakeViewAnimator` 调用 `setMiSelfBlurCompat()` 更新。
+- 复用 View 上遗留的 Classic blend colors：Bionics 分支不会主动调用 `clearMiBackgroundBlendColorCompat()`；它可能与材质叠加，但不能把所有黑底都归因于这一项。
+
+结论：不能把 SoftGlass 简化成“创建时提前 setMiGlass，然后统一清空所有黑层”。实机验证表明，提前给 detached/隐藏目标安装材质、在首次可见前统一清共享层、或只补清 Classic blend colors，仍可能导致动画与稳定态持续黑底，说明系统的 container alpha、fake mask、self blur、采样窗口和真实/fake 交接必须作为一个时序整体处理。当前没有经过实机验证的统一提前创建方案；文档不得把这些尝试写成已解决方案。
+
+稳定 SMALL/BIG 的原生 Bionics 同时依赖 root background blur 与 pass SurfaceTexture。`updateWindowBlur(false)`、`updatePassWindowBlur(false)`、`finalizeAnimFinished()` 属于系统采样生命周期；在没有确认当前真实/fake 槽确实提交可见 Bionics 帧前，不应长期拦截关闭或重建纹理。模糊强度由 `setMiGlassBlurRadius(small, big)` 控制，系统默认是 `50/500`。
+
+通知栏展开、下拉阈值和隐藏通知图标会派发窗口级临时隐藏事件。手机版对 properties=0 的一次性岛单独计算隐藏条件，仍可见的 `ShowOnceBigIsland` 保留柔光租约。普通岛则由 `bigIslandToTempHiddenAnimation()` / `smallIslandToTempHiddenAnimation()` 将当前真实槽向挖孔收缩并淡出。通知栏触发的暂停复用目标级 pre-draw 监听，在真实/fake 槽或祖先不可见、透明度接近零后才撤掉采样和材质写入保护。普通岛仍处于逻辑 BIG/SMALL 时也能完成暂停。面板收回时取消本窗口尚未执行的暂停，已隐藏的槽继续按可见恢复流程获取租约。用户已确认一次性岛黑底消失，普通岛退场动画仍待实机复测。
+
+## 8. 圆角
+
+### 8.1 小岛和大岛
+
+小岛、大岛通常使用：
+
+```text
+com.android.systemui:dimen/island_radius
+```
+
+如果资源不存在，可回退到：
+
+```text
+view.height / 2
+```
+
+### 8.2 焦点通知
+
+不能直接使用共享岛 Outline 的半径。实机曾读取到：
+
+```text
+Outline.radius = 77dp
+```
+
+这是胶囊形岛轮廓，不是焦点卡片圆角矩形的真实半径。焦点稳定状态需要使用焦点专用背景/资源的半径；当前代码曾使用 `32dp` 作为回退值，但它不是已证明的系统真实值。
+
+### 8.3 fake 动画
+
+fake 动画层应使用 SystemUI 的 `updateOutline()` 和 `updateExpandViewBlur()`，不要用固定焦点圆角覆盖动画 Outline。
+
+## 9. 多岛实例
+
+双岛场景不能假设只有一个内容实例。
+
+当前安全建模方式：
+
+```text
+DynamicIslandBackgroundView 实例 -> OuterBlur
+DynamicIslandContentView/View -> 弱引用刷新目标
+```
+
+每个 `OuterBlur` 独立保存：
+
+- 当前类型的 `BackgroundBlurDrawable`
+- 系统原始 Drawable
+- active 状态
+
+Map 使用弱键，按具体 `DynamicIslandBackgroundView` 实例隔离。View detach 时必须：
+
+- 将模糊半径设为 `0`。
+- 断开 Drawable callback。
+- 从缓存移除 `OuterBlur`。
+- 移除 attach-state listener。
+
+## 10. 主动刷新
+
+SystemUI 不一定会为小岛和大岛自然调用 `updateBackgroundBg()`。做法是主动获取具体 View：
+
+```java
+getSmallIslandView()
+getBigIslandView()
+updateBackgroundBg(view, false)
+```
+
+该调用不是 SystemUI 在每次 `updateDarkLightMode()` 后必然执行的原始流程，而是模糊 Hook 为安装外层 BlurDrawable 追加的刷新。因此只能在目标类型的 `BlurConfig.isActive=true` 时调用。若模糊全关仍主动调用，支持背景模糊的设备会进入 SystemUI 的 MiBlur 分支：设置 blur mode 和 BlendColor、清空 View background，结果是仅加载 Hook 就把原生纯黑岛变成灰色。
+
+主动刷新必须检查内容实例当前状态，只刷新匹配类型：
+
+```text
+current state == refresh target type
+```
+
+否则历史 `expanded_view`、旧大岛或另一个岛的 View 可能被重新激活。
+
+## 11. 当前 Hook 文件职责
+
+### `IslandBlurHook.kt`
+
+路径：
+
+```text
+android/app/src/main/kotlin/io/github/hyperisland/xposed/hook/SystemUI/IslandBlurHook.kt
+```
+
+职责：
+
+- 加载三种状态模糊配置。
+- 识别状态和具体 View 类型。
+- 在 `DynamicIslandBackgroundView.drawable` 中创建和管理 `BackgroundBlurDrawable`。
+- 保存并恢复系统外层原 Drawable。
+- 按具体背景 View 实例隔离多个岛。
+- 主动刷新小岛和大岛 View。
+- 复用 SystemUI `onDraw()` 的动态 bounds 绘制模糊。
+- 在 View detach 时释放 callback 和模糊资源。
+- 排除 `fake_expanded_view`，避免把过渡层当作稳定焦点 View。
+- 为三个 fake 子 View 创建和释放独立的过渡 BlurDrawable。
+
+### `IslandBackgroundHook.kt`
+
+路径：
+
+```text
+android/app/src/main/kotlin/io/github/hyperisland/xposed/hook/SystemUI/IslandBackgroundHook.kt
+```
+
+职责：
+
+- 替换 `DynamicIslandBackgroundView.drawable` 为图片或 GIF。
+- 处理系统 View background、MiBlur mode 和 BlendColor。
+- 在自定义背景模式下清除遮罩。
+- 协调实时模糊，避免具体内容和 fake 层叠加 stock 黑色背景。
+- 对 `fake_expanded_view` 禁用第二层原生模糊和默认 BlendColor。
+- 限制图片/GIF 解码尺寸并使用弱 Drawable callback，避免 SystemUI OOM 和 View 泄漏。
+
+### `IslandTransitionVisualHook.kt`
+
+路径：
+
+```text
+android/app/src/main/kotlin/io/github/hyperisland/xposed/hook/SystemUI/IslandTransitionVisualHook.kt
+```
+
+职责：
+
+- 跟踪 `DynamicIslandContentFakeView` 实例和三个 fake 子 View。
+- 在 fake 子 View 上应用对应类型的过渡模糊或独立自定义背景 Drawable。
+- 保存并恢复每个 fake 子 View 的系统原始 background。
+- 保存并管理 fake root、`fakeContainer`、`fakeMask` 的共享系统遮罩。
+- 根据当前实际可见且 alpha 有效的 fake 子 View识别当前渲染类型。
+- 只按当前渲染类型的 `SMALL/BIG/EXPAND` 配置清除或恢复共享黑罩。
+- 在 fake 到真实岛交接期间管理真实 `DynamicIslandBackgroundView.backgroundAlpha`，防止未模糊状态透明后再渐显。
+- 当前真实状态启用模糊时解除不透明交接标记，避免黑罩压住大岛或焦点通知模糊。
+- 在配置变化和 View detach 时刷新或释放过渡资源。
+
+### 其他相关 Hook
+
+`KeepIslandHook` 在手机默认岛样式下处理常驻岛自动隐藏与应用退出的交接。JADX MCP 核查 `18.3.2.5.0` 的 `request_close_position` 会在 `ExitApp` 前预测并缓存目标矩形。确认退出应用有 `AppExpanded` 岛、常驻岛仍在 Big/Small 槽且自动隐藏已开启时，预判前通过原生 `removeDynamicIslandView` 让常驻岛退出槽位，并为该次 `removeDynamicIslandData` 使用原生无动画参数。后续 `dismissIsland` 更新若遇到同一窗口中已移除的常驻岛，跳过重复的视图清理，避免再次释放退出动画的通知生命周期。真实岛与 fake 继续使用系统按实际队列生成的布局。非主线程请求把让位交给主线程，关闭开始阶段仍使用系统的落点更新流程。`appExit` 后按实际 Big/Small 接管自动隐藏，重新进入应用或原生删除时清理对应记录。未完成退出的短时让位最多保留 2 秒，再按当前状态恢复。真实岛消失后的常规恢复延迟为 500 ms。该流程待实机验证。
+
+`SystemUI/SingleIslandDispatchHook.kt` 通过「外观 → 其他」底部「岛行为」接入。`pref_island_behavior_style` 为 `default / single`，默认 default：onInit 在任何 Hook、加载器回调或颜色监听注册前返回；切换样式提示已有 `restart_scope_app` Toast，重启作用域后生效。`pref_island_indicator_color` 为 `follow_island / invert_island / black / white`，默认 follow_island，颜色可热更新；UI 仅单岛显示颜色选项，用展开高度、Y 位移与淡入淡出动画切换。两键登记于 appearance_more_ui 分类，复用 pref_ 同步链路，仓库读写和备份导入统一规范枚举。
+
+JADX MCP 核查组件 `18.3.2.5.0`：保留原生 Big → Small → Hidden 排序/补位链，小岛仅作队列槽。单岛宽度/位置居中，触摸区域只留大岛。真实 small 子 View 在状态、alpha 和 `IslandPropertyUpdater.updateSmallIsland` 写入后持续透明；Small → Hidden 的根内容/背景仍压为透明，防止左滑隐藏全部岛时闪现。队列 fake 的 Small/Big/Expanded 子槽透明，并以空 clipBounds 隐藏共享背景/遮罩；离开队列态或 detach 恢复原裁剪，不更改 fake root 可见性和原生结束回调。`hiddenList` 的 Empty 前后分别对应右/左队列，RTL 对调圆环。圆环附在背景 foreground，按 actual* 的原生边界绘制，100°、约 2dp，侧边中点净间距为两倍线宽。指示器选项为「跟随岛背景 / 反跟随岛背景 / 黑色 / 白色」，保留旧 follow_island/invert_island 存储值；已移除的 follow_status_bar 由统一规范函数回落到默认跟随。圆环改为单层实色，移除独立描边画笔；自动模式用原有描边决策控制整条圆环在 #2F2F2F 灰色与黑色之间切换。MCP 确认手机 updateDarkLightMode 的 BIG/ShowOnceBig 事务在第 3 参数为 false 时进入描边分支；捕获该决策并通过 IslandOutlineHook.resolveOutlineVisibility 合并现有强制显示/隐藏与柔光的有效策略。跟随模式在大岛有描边时用整条灰色、否则黑色，反跟随取反；仅随岛动画透明度变化，不复制 highlightColor 的颜色/20% 透明度，也不依赖可能已被材质替换的 GradientDrawable 私有画笔。固定黑白模式保留。
+
+应用返回 Small/Hidden 队列时，预测关闭矩形与 fake 两套几何入口统一收至当前大岛内部、约 0.6 倍岛高的小尺寸落点，不再飞出屏幕，也不显示第二个大岛。队列 fakeToSmall/fakeToBig 使用原生 fakeToHidden，保留 reset、缩放、Outline、alreadyCloseAppEnd 和生命周期结束。完成 handoff/closeEnd 后消费本轮弱引用入队记录，当前大岛轻弹一次（320ms 阻尼 Y 动画），同步外置光效；不改原生 translation/scale，已有其他 View Animation 时不覆盖。取消、改为实际 Big 或目标变化不误弹；记录上限 128、10 秒过期。实际成为当前 Big 时仍用原生 Big 动画，临时隐藏保留系统落点。运行时完整预检失败则不启用，部分安装失败撤销；View/裁剪缓存为弱引用且各最多 128，运行时类最多 32。新增行为尚未编译或实机验证，需回归音乐队列返回、左右滑动/隐藏、展开收起、队列删除、横屏、小窗、锁屏及材质/光效组合。
+
+通过 JADX MCP 核查组件 `18.3.2.5.0`：`DynamicGlowEffectView.stopGlowEffect(boolean)` 在停止当前 shader 后把 window 级上下共享容器设为 `GONE`；`startGlowEffect()` 遇到 `enabledGlowEffect=true` 会直接返回。`initExpandEffectShader` 在 `EXPANDED_TO_BIG` 的 `ANIM_START` 停止旧展开光效，此时大岛仍可能隐藏或 alpha=0。只在 stop 回调补偿并删除暂时不可见的 running 项，会漏掉随后显示的大岛。`IslandOuterGlowHook` 现按 boolean stop 能力启用兼容：保留暂时不可见的弱引用 running 项（最多 128 个，stop/detach 清理），在 start 返回、原生 `setAlphaOfGlowEffect(float)` 写入和 `LightBgView.onVisibilityChanged()` 完成真实内容交接后恢复共享容器。恢复要求 shader 仍启用、宿主实际可见且 alpha>0、所属真实 ContentView 的当前状态/具体槽一致、效果 View 仍属于该上下容器；只使用系统 `alphaOfGlowEffect`，不重播 shader 或强制 alpha=1。stop 仲裁只处理相同上下容器，旧版无参 stop 不安装交接 Hook。需实机回归连续展开/收起、仅大岛光效、双岛、隐藏/删除和小窗动画。
+
+外圈光效由官方 `LightBgView/LightBgShader` 写入独立上下效果 View，OS4 效果 View 位于窗口外置容器，不能继承岛背景旋转。按压倾斜现同步具体展开通知的两个效果 View，通过不含旋转的布局/位移坐标换算同一空间支点，不修改共享容器；复位/detach 恢复原旋转、支点、相机距离。`containerScheduleUpdate()` 只更新容器，漏掉 `updateBigIsland/updateExpanded` 中的光效几何入口，OuterGlow 在该调用后以同一属性快照和官方半径计算补调 `updateGlowEffectAnim`，不重复写内容缩放/透明度。
+
+小岛沿用本条通知的大岛外圈光效设置和原生 `LightBgView/LightBgShader` 流光。插件 `18.3.2.57.0` 的原生光晕 shader 会清空画布中央的矩形，可能切断较小的光圈。仅为小岛的光晕实例移除这一矩形裁剪，改用圆角轮廓保留岛内透明。两层光效放在当前显示槽所在窗口的根 Overlay。真实态读取背景 `actual*`，过渡态跟随 fake small 的变换和透明度。两个槽在预绘制交接，隐藏或 detach 时释放光效。
+
+防烧屏不再因光效开启而暂停。JADX 确认 `AvoidScreenBurnInHelper` 仅直接修改内容 `translationX/Y` 与背景 `actual*`，未更新外置光效。OuterGlow 在官方四向位移完成后把同一实际增量同步给所属大岛的上下效果 View（若效果已经是内容后代则不重复叠加），不移动共享容器。后续 `setGlowEffectPosition()` 使用所属真实 ContentView 的实际 translation 与其动画 delegate `snapshotProperties().containerX/containerTransY` 的差值修正四边坐标，保留光效尺寸/半径并随官方动画覆盖或复位自动消除偏移；fake owner 不走真实岛补偿。reset/fade 完整执行官方逻辑，reset 的位置交接通过正常光效几何入口处理，避免重复添加复位增量。不缓存累计偏移或 View 引用；双岛实例互相隔离。位移与倾斜/轮廓组合仍需实机验证。
+
+`animation/ExpandedPressTiltHook.kt` 为灵动类型的展开通知增加按压倾斜，配置键为 `pref_expand_animation_press_tilt`，默认关闭。采用控制中心 `RotationItemViewHolder.touchDown()` 同类的对侧支点和原生双轴旋转；边缘正中按压只启用一个轴，中心按压保留系统缩放。效果施加于整个 `DynamicIslandBackgroundView`（包含真实内容）及独立 fake root，不重复处理背景内的子 View；系统缩放、轮廓和位移弹簧保持原路径。原 RuntimeShader 曲面、外围衰减、矩形内外采样方案已被实机反馈否定（阴影收缩、缺口），现全部撤除，也不改写 RenderEffect。松手复位可随回弹开关轻微越界，拖动超过 touch slop 则退出倾斜。对象采用有数量上限的弱引用缓存，关闭配置、状态离开展开或 View detach 时恢复旋转、支点和相机距离。当前原生倾斜与阴影组合仍需实机确认，不含额外曲面弯曲。
+
+`animation/ExpandedMiniWindowFollowHook.kt` 为小白条下拉补充跟随位移，受「跟随效果」开关（`pref_expand_animation_gesture_follow`）控制。焦点通知下拉时在系统 `onTrackingFakeViewUpdate(float)` 的原生 top/bottom 位移与 alpha 渐隐之上，再把 fake root 的 `translationX`（左右，取 rawX 差值）与 `translationY`（上下，取该回调自带的累计下拉距离）叠加有界 tanh 跟随。fake root 的原始 `translationX/Y` 在首次接触时记录为 pristine base（弱引用缓存、有上限），松手/复位/detach 时回到 base，避免上一次斜向下拉中断后残留的左右位移被当成新的原点造成瞬移。热点（MOVE / onTrackingFakeViewUpdate）不反射，仅弱引用缓存与数值运算；仍需实机确认手势手感与原生 mini-window 过渡叠加效果。
+
+| 文件 | 关系 |
+| --- | --- |
+| `IslandOuterGlowHook.kt` | 使用 `getBigIslandView()` 获取具体大岛 View，可作为反射参考 |
+| `TextShadeHook.kt` | 大岛自定义背景或大岛模糊开启时禁用文本滚动阴影 |
+| `SmoothIslandHook.kt` | 处理岛描边和背景重绘，可能与背景 Drawable 生命周期交叉 |
+| `IslandDimenHook.kt` | 修改岛尺寸，可能影响圆角和模糊 bounds |
+| `IslandTopOffsetHook.kt` | 修改位置，可能影响窗口动画和最终几何位置 |
+
+## 12. 配置键
+
+### 小岛
+
+```text
+pref_small_island_horizontal_offset
+pref_island_blur_small_enabled
+pref_island_blur_small_radius
+pref_island_blur_small_color
+pref_island_bg_small_path
+```
+
+`pref_small_island_horizontal_offset` 是双岛状态下相对系统间距的偏移量，单位 dp，范围 `-10` 到 `50`。`0` 跟随系统，正值增大大小岛距离，负值减小距离，最终间距不会小于 `0`。
+
+OS3 与 OS4 都通过 `dimen/island_space` 提供双岛间距，因此在系统资源原值上叠加偏移。该值会在 `DynamicIslandBaseContentView` 构造时缓存，修改配置后需重启 SystemUI。
+
+### 大岛
+
+```text
+pref_island_blur_big_enabled
+pref_island_blur_big_radius
+pref_island_blur_big_color
+pref_island_bg_big_path
+```
+
+### 焦点/展开
+
+```text
+pref_island_blur_expand_enabled
+pref_island_blur_expand_radius
+pref_island_blur_expand_color
+pref_island_bg_expand_path
+```
+
+模糊半径当前限制为 `0-275`。颜色使用 ARGB。
+
+## 13. 已知问题和常见错误
+
+### 按应用隐藏音乐岛
+
+SystemUI 的 `com.android.systemui.statusbar.notification.mediaisland.MiuiIslandMediaControllerImpl.addDynamicIslandView(holder, fakeHolder, MediaData)` 独立创建、更新音乐岛，来源应用和通知身份分别为 `MediaData.packageName` / `notificationKey`，不经过插件的 `FocusNotificationController.addDynamicIslandView()`。
+
+`NotificationHook.kt` 在该音乐专用入口读取应用级 `notification.show_island`（默认 true，映射 `pref_media_island_show_island_<包名>`）。仅媒体通知总开关开启且未降级普通通知时执行隐藏；阻止本次音乐岛创建/更新，已有岛只在 `currentKey == notificationKey` 时调用该控制器的 `removeDynamicIslandView* (key, true)`。不改媒体字段、共享窗口或其他岛 View；开关在后续音乐岛创建/更新时生效。UI 开启显示超级岛与降级普通通知会互相关闭，旧配置冲突时普通通知优先。此路径已通过 JADX 核查当前 SystemUI 实现，尚未编译或实机验证。
+
+### 默认人脸成功岛保留
+
+默认解锁样式的成功 Lottie 在结束、取消及 `IslandIconViewHolder.onHidden()` 时调用 `clearFaceRecognition(data)`，该方法发出 `DeletedDynamicIsland`。仅「关闭自动展开 + 保留」时，`KeyguardUnlockStateHook` 对模块通知 ID/owner、本次成功通知 token、成功图片及控制器仍在锁屏成功态的组合短路此方法；反射失败或身份不匹配时执行原方法。插件 `FocusNotificationController.setUpDynamicIslandDataBundle()` 会重建白名单 extras，必须通过 `miui.sbn` 取得原通知 owner/token。仅该分支的成功岛删除超时延长到 86400 秒兜底，`expandedTime` 保持 2 秒。
+
+不拦截整个 `onHidden()`、全局删除事件或窗口移除：新一次性岛仍可由 `ShowOnceIslandHandler` 以 `Deleted(deleteByAddNew=true)` 替换旧岛；锁屏消失或灭屏时先释放 token，再撤销模块通知，让系统清空临时展示槽并恢复其他岛。保留期间仍使用系统一次性岛槽，不改变其他岛的优先级和调度规则。需实机回归成功后停留锁屏、新一次性岛替换、音乐/计时岛恢复及灭屏重亮；机制核查所用 JADX 插件为 18.2.2.2.0，18.3.2.40.1 的行为仍需对应设备确认。
+
+展开内容另有 `FocusNotifPreHandler.clearFaceRecognition(sbn, ...)` 自动撤销路径，仅保护关闭自动展开的本轮成功通知。用户实测原地同步动画进度仍会在收起后重播，因此撤除 completion listener/composition 回调 Hook。「自动展开 + 保留」完整恢复旧流程：原动画不使用 token 保护、不延长 2 秒超时、不新增 ongoing 标记，1150ms 后以同一通知 ID 更新静态成功 RemoteViews/图片，保留原先静态几何修正；不额外调用窗口 collapse。此前混用动画销毁保护与静态更新、以及先 collapse 再更新的尝试已因时序/透明回归撤除。关闭自动展开时继续原地保留，不安排重发，手动展开的成功内容直接绑定末帧。未开启保留、识别中、失败及锁头样式不进入该重发路径。`hold` 普通日志受模块调试开关控制。需实机确认两种自动展开设置、退出锁屏、新岛替换与柔光交接。
+
+### OS3 计时通知 TextWatcher 重入
+
+OS3 JADX 中 `IslandSameWidthDigitViewHolder$textWatcher$1.afterTextChanged()` 在 `timerInitialized` 且文本长度变化时同步发出 `UpdateDynamicIsland`；holder 的 `onDetach()` 会从 `sameWidthDigit` 移除该 watcher。如果事件同步触发重建，`TextView.sendAfterTextChanged()` 仍按进入时的监听器数量遍历，但列表已经缩短，可能出现 `Index 1 out of bounds for length 1`。跑马灯为同一 TextView 注册的额外 watcher 会形成多监听器场景；现有计时颜色 `setText` Hook 在 `chain.proceed()` 返回后执行，不能保护原方法内部的越界。
+
+`TimerWatcherCompatHook` 按具体 watcher 字段结构探测兼容路径，将该分支的原生更新事件合并到主线程下一任务，保留每次 tick 的原生文本写入、长度判断和最新通知数据；holder `onDetach()` 取消待执行事件。待执行任务弱引用 holder，最多 128 项，不捕获 Editable 或通知数据。该修复不按 SDK 号区分 OS3/OS4，不全局拦截 TextView、不吞掉 `setText` 异常。用户已反馈原 OS3 崩溃场景修复成功；计时文本长度变化（如 `59:59 → 1:00:00`）、展开/收起及跑马灯开启时的连续更新可作为后续回归场景，OS4 回归结果尚未反馈。
+
+### 13.1 过渡出现黑块
+
+可能来源：
+
+- `DynamicIslandBackgroundView` 外层 Drawable 未抑制。
+- `fake_expanded_view` 的系统 BlendColor。
+- `fake_island_mask`。
+- 原始 `dynamic_island_background` Drawable。
+- 旧 View 恢复了错误或空的 stock background。
+- 新旧模糊层交接之间出现一帧空档。
+- 共享遮罩错误地按其他状态的配置保留，例如当前渲染 `BIG` 已启用模糊，但判断只读取 `SMALL`。
+
+如果黑罩始终跟随一个透明/模糊 fake 岛向上移动，应优先检查当前实际渲染的 fake 子 View 类型，而不是检查任意全局模糊开关。
+
+### 13.2 到达后透明再渐显
+
+若 fake 层隐藏前仍满足以下条件：
+
+```text
+fake root alpha = 1
+当前 fake 子 View alpha = 1
+当前 fake 子 View background != null
+```
+
+但到达后仍透明并随后渐显，问题位于真实 `DynamicIslandBackgroundView.backgroundAlpha` 交接，不应继续修改 `fakeMask`、fake 子 View alpha 或提前调用真实内容 View 的状态方法。
+
+### 13.3 模糊缩小时不连续
+
+应确认 BlurDrawable 是否仍由 `DynamicIslandBackgroundView.onDraw()` 使用 `actual*` 参数设置 bounds。不要切回具体内容 View、普通内部子 View或外部 overlay。
+
+### 13.4 模糊停留在旧位置
+
+可能来源：
+
+- `DynamicIslandBackgroundView.drawable` 被其他 Hook 或 SystemUI 覆盖。
+- `actualLeft/Top/Width/Height` 没有在动画帧更新。
+- 多个背景 View 实例共用了错误的 `OuterBlur`。
+- 旧 BlurDrawable callback 未断开。
+
+### 13.5 焦点变大岛后残留
+
+`expanded_view` 在 `state != EXPAND` 下的更新必须视为陈旧更新并忽略，不能用它关闭当前大岛的外层 BlurDrawable。`fake_expanded_view` 仍不能作为稳定焦点类型目标。
+
+### 13.6 类型判断顺序
+
+识别 View 时应先检查资源名：
+
+```text
+fake_expanded_view -> 过渡层，不是稳定 EXPAND
+```
+
+再检查类名。否则类名包含 `ExpandedView` 的 fake/包装 View 可能被误判。
+
+### 13.7 功能全关时缺少纯黑遮罩
+
+检查两条路径：
+
+- `IslandBlurHook.applyTransitionBlur()` 是否在 `anyBlurEnabled=false` 时仍清空 fake 根层和子 View background，或隐藏 `fake_island_mask`。这些过渡回调始终会运行，清理函数必须自行检查模糊总开关。
+- `IslandBlurHook.hookBackgroundDrawing()` 是否在当前背景实例没有 active `OuterBlur` 时跳过原始 `onDraw()`。这会删除外层纯黑 Drawable，只留下灰色 MiBlur/BlendColor。
+- `IslandBlurHook.hookIslandState()` 是否在对应模糊关闭时仍主动调用具体 View 的 `updateBackgroundBg()`。这是额外调用，不是透明观察；它会让 SystemUI 重新配置 MiBlur 和 BlendColor。
+
+## 14. 调试日志建议
+
+稳定状态更新至少记录：
+
+```text
+contentView identity
+backgroundView identity
+state
+target type
+target View class/id
+target size
+target visibility
+target translationX/translationY
+target scaleX/scaleY
+BlurDrawable identity
+BlurDrawable active
+stock background identity
+```
+
+fake 动画至少记录：
+
+```text
+fakeView visibility/alpha
+fakeExpandedView visibility/size/scale/translation
+fakeExpandedView blur mode
+fakeExpandedView background
+fakeMask visibility/alpha/background
+realView visibility
+backgroundView visibility
+realView.state
+realView.lastState
+```
+
+建议重点测试转换：
+
+```text
+SMALL -> BIG
+BIG -> SMALL
+BIG -> EXPAND
+EXPAND -> BIG
+SMALL -> EXPAND
+EXPAND -> SMALL
+双岛 SMALL + BIG
+双岛状态互换
+焦点通知出现和消失
+应用开关动画
+Mini Window 手势
+```
+
+## 15. 已确认结论
+
+1. 稳定态实时模糊应放在每个岛实例的 `DynamicIslandBackgroundView.drawable` 中；过渡态使用当前 fake 子 View 的独立 `background`。
+2. `DynamicIslandBackgroundView.onDraw()` 的 `actual*` bounds 是跟随双岛、缩放、位移和消失动画的关键。
+3. 稳定态 `small_island_view`、`big_island_view` 和 `expanded_view` 用于状态识别与圆角参考，不各自持有 BlurDrawable；对应 fake 子 View 可以持有过渡 BlurDrawable。
+4. `expanded_view` 是真实焦点 View，`fake_expanded_view` 是动画内容宿主，两者不可混用。
+5. fake View 是 SystemUI 动画状态机的一部分，不能简单删除，但其 stock 黑底、BlendColor 和第二层模糊需要清理。
+6. `updateBackgroundBg()` 同时控制背景 Drawable、MiBlur mode 和 BlendColor。
+7. 黑色效果不一定来自单一 Drawable，必须分别检查外层背景、具体 View、MiBlur BlendColor 和 fake mask。
+8. 多岛按具体 `DynamicIslandBackgroundView` 实例隔离 `OuterBlur`。
+9. SystemUI 不一定主动刷新小岛和大岛背景，必要时要调用具体 getter 和 `updateBackgroundBg()`。
+10. 稳定态普通内部子 View BlurDrawable 可能扩大到整个 ViewRoot，不能替代外层宿主；由 `IslandTransitionVisualHook` 管理的 fake 动画子 View是明确例外。
+11. 三种模糊全部关闭时不得清理 fake 层，系统纯黑过渡遮罩必须完整保留。
+12. inactive 背景实例必须执行 SystemUI 原始 `onDraw()`；不得通过跳过外层绘制来清理内层遮罩。
+13. 主动 `updateBackgroundBg()` 只允许用于 active 模糊类型；模糊全关时不得追加任何背景刷新。
+14. 稳定态 BlurDrawable 宿主是 `DynamicIslandBackgroundView.drawable`，过渡态 BlurDrawable 宿主是当前 fake 子 View 的 `background`，不能合并描述为同一宿主。
+15. fake root、`fakeContainer` 和 `fakeMask` 是三态共享遮罩，必须按当前实际渲染的 fake 子 View 类型决定清除或恢复。
+16. 不能用“任一模糊开启”清除共享遮罩，也不能固定只读取 `SMALL`；两者都会破坏三态组合。
+17. fake 隐藏前仍完全不透明但到达后透明再渐显时，应检查真实 `DynamicIslandBackgroundView.backgroundAlpha` 和 `alphaAnimation()`。
+18. 交接期固定真实背景 alpha 只适用于当前真实类型未开启模糊的实例；已开启模糊时必须解除该限制。
+19. OS4 柔光玻璃的 SMALL/BIG/EXPAND 均写入系统 Bionics View 材质，不能回退到模块的 `LiquidGlassDrawable`。
+20. `updateExpandedView()` 会在 SMALL/BIG 稳定期间先调用 `updateBackgroundBg(expanded_view)`，再替换通知内容；对自定义 SOFT 而言这是隐藏目标的结构准备，不是渲染授权。应阻止该次 Bionics 写入，并在 fake→真实交接或首次可见 `onPreDraw` 前安装目标材质。
+21. 原生 EXPAND token 含 `.06/.06/.06/.6` 灰色混色；模块默认必须把 11..14 通道清零，仅在用户配置混色时写入颜色与 alpha。`dynamic_island_background_island` 本身无填充色，但 fake 根容器的 `dynamic_island_background` 是纯黑色，三态 Bionics View 就绪后必须清掉该共享黑底。
+22. `DynamicIslandWindowView.updateWindowBlur()` 在 Bionics 模式使用 `setMiGlassBlurRadius(50, 500)`；该半径不属于 42 项 shader 参数。自定义值必须保持 1:10 双级比例，并在最后一个 SOFT View 释放后恢复 `50/500`。
+23. `-50..50` 柔光配置是百分比微调：非零 token 通道按 `/100` 缩放，原值为零的通道才直接写入配置值。
+24. `MaterialConfig.toBlurConfig()` 对 SOFT 返回 disabled；真实 SMALL/BIG 刷新不得用 `BlurConfig.isActive` 作门禁，否则只会写入 fake 动画层，稳定态会完全透明。
+25. OS4 dex 中动画类的二进制包名可能包含 `anim.p110ui.animator` 或 `anim.p120ui.animator`；jadx 声明可能统一显示为 `anim.ui.animator`，兼容 Hook 必须同时探测三种名称。
+26. `dynamic_island_child_view.xml` 在 `container` 上预置了 `dynamic_island_background`。恢复已有岛时可能没有首个 `IslandPropertyUpdater` 帧，因此 OS4 必须在内容膨胀/首个 `updateDarkLightMode()` 状态事务中清理该初始共享黑底。
+27. `DynamicIslandWindowView.updateExpandedViewMaterial()` 会在 owner 仍为 BIG/Hidden 时刷新 `fake_expanded_view`；该目标必须按自身槽位识别为 EXPAND，不能回退 owner 状态，否则晚到的刷新可能重新安装系统 `EXPANDED_GLASS_TOKEN`。
+28. `finalizeAnimFinished()` 会按系统状态请求关闭 pass-window blur；模块不得事后校准或重建采样器。若仍有明确的 real/fake SOFT 渲染租约，只能在 `updatePassWindowBlur(false)` 源调用中把参数替换为 `true`，保证系统缓存、FPS 与 native flag 同步；无租约时必须放行关闭。
+29. `EXPAND state=BIG` 的隐藏准备回调不得改动当前 SMALL/BIG 的共享外层，也不得给 EXPAND 安装 Bionics；隐藏 EXPAND 的全尺寸 RenderNode 即使没有采样租约仍会污染同窗口 crop，形成永久白色模糊。
+30. SOFT 在稳定 SMALL/BIG 保留同一个 pass SurfaceTexture，但不读写 `lastPassWindowBlurEnabled`；隐藏材质必须释放，避免旧 crop。
+31. fake SMALL/BIG/EXPAND 是长期复用的附着 View，但模块只允许当前实际绘制的一个槽位持有 Bionics 材质。隐藏槽位释放材质，交叉淡入按可见子槽 alpha 交接。
+32. pass-window 保活必须按包含父层 alpha/visibility 的实际绘制状态判断，不能按任意 managed View 判断；保活中的采样器必须保持 60 FPS，不能使用系统关闭态的 `-1`。
+33. `preparingTypeHolder=EXPAND` 标记的是 `updateExpandedView()` 在状态切换前发出的隐藏目标初始化。它不能按普通 stale 处理去覆盖当前外层，但也不能预热 Bionics；材质由后续 fake→真实交接或可见 `onPreDraw` 获取。
+34. `onIslandTempHide(true)` 是临时隐藏的起点。通知栏场景等普通岛结束可见绘制后再暂停 SOFT 租约，仍可见的一次性岛继续使用柔光。恢复时取消尚未执行的暂停，在真实 View 首次重新可见的 `onPreDraw` 边缘重新获取已暂停的租约并清理系统写回的外层黑底。
+35. Bionics 材质所有权与采样器渲染租约必须分离：预备 View 可以先写材质，但只有实际 real/fake 槽能持有租约。仍有租约时在 `updateWindowBlur(false)` / `updatePassWindowBlur(false)` 源头把参数替换为 `true`；最后一个租约释放后完整放行系统关闭，禁止永久常驻采样器。
+36. fake 动画目标由 `FakeViewAnimator.fakeViewToSmallIsland/BigIsland/Expanded` 决定；目标子槽实际接管绘制前，旧槽可继续使用已有材质。Hidden/Deleted 释放全部 fake 槽的材质和采样租约。
+37. active SOFT 租约还必须保护对应 View 的 `setMiViewMaterialType(..., 0)` 与 `setMiViewBlurModeCompat(..., 0)` 源写入；租约释放后不拦截，确保默认材质、隐藏态和删除态继续执行系统清理。
+38. OS3/OS4 不得用 Android SDK 号区分；只有 `EXPANDED_GLASS_TOKEN.getToBionicsParams()` 与 `MiBackgroundStyle.isBionicsActive()` 同时存在时才安装 Bionics 窗口/材质源 Hook，否则 SOFT 的真实态和 fake 过渡态都走高斯兜底。
+39. `restoreFakeViewBackground()` 只在当前 fake 目标确实可用 Bionics 时禁止原调用；OS3 或系统关闭 Bionics 时必须先执行系统恢复，再在同一调用中安装高斯兜底，不能直接清空共享 mask。
+40. `updateExpandedView()` 的准备标记 Hook 必须实际注册，用于把隐藏 EXPAND 写入与普通 stale/真实 EXPAND 区分开，并在源头跳过隐藏 Bionics 创建。
+41. SOFT View 接管时必须保存并在 release/detach 时恢复原 `outlineProvider`、`clipToOutline` 和背景；detach listener 不得捕获 View，避免弱缓存 value 反向持有 key。
+42. OS4 的外层 stock drawable、`container/island_mask` 只能在当前 ContentView 已实际持有 Bionics 材质或实例级高斯兜底后清除；仅凭配置为 SOFT 就在 `setDrawable`、`onFinishInflate` 或 `IslandPropertyUpdater` 清层，会让少走标准背景回调的 RemoteViews、`ShowOnceBigIsland` 或替换 View 实例完全透明。
+43. `currentIslandVisible()` 只描述整个岛窗口，不能识别“窗口持续可见但具体 BIG/EXPAND View 被替换”的情况。首次可见预绘制还必须跟踪实际 concrete View 身份和祖先 alpha/visibility，在目标实例变化时重新提交材质与共享层；若 promoted/RemoteViews 宿主缺少 Bionics View API，则在同一实例走稳定态高斯兜底，禁止透明失败。
+44. `ShowOnceBigIsland`（例如充电岛）由 `currentTempShow` 的第二个 ContentView 承载，不一定出现在 controller `getView()`。其 `updateBackgroundBg()` 可能发生在真实 BIG View 尚未 attach/布局时；由于系统方法在 `parent == null` 时会直接写黑底，不能把这次回调视为已成功创建 Bionics。任何目标级 pre-draw 方案都必须同时验证采样窗口、共享层和 fake→真实交接，不能只以 `setMiGlass()` 调用成功作为 renderer committed。
+45. 首次可见 pre-draw 不是天然的原子交接点。实机已否定“提前安装材质，pre-draw 只清外层/container/mask”这一充分性假设：即使柔光 shader 存在，`IslandPropertyUpdater` 的 container 黑底、fake 共享 mask、self blur 或采样状态仍可让动画和稳定态保持黑色。
+46. OS4 Bionics 岛 View 使用 framework `setSmoothCornerEnabled(true)` 的固定系统曲线；自定义连续曲率不能只替换 `Outline.setRoundRect()`。SmoothIsland 需保留原 OutlineProvider 的几何与 RenderNode 副作用，仅对胶囊轮廓关闭目标 View 的官方平滑角并写入自定义 Path；OS4 能力以 `EXPANDED_GLASS_TOKEN`、`BionicsToken.getToBionicsParams()` 与 `MiBackgroundStyle.isBionicsActive()` 联合探测，OS3 继续走原路径。
+47. 真实态与 fake 态只统一了 `DynamicIslandBaseContentView.updateBackgroundBg()` 材质入口，没有统一 View 生命周期。实现层必须分别跟踪真实具体槽、fake 动画目的槽以及两者的 handoff。
+48. OS4 黑底至少有三条明确来源：`updateBackgroundBg()` 的非 Bionics/无 parent 分支、`IslandPropertyUpdater.updateContainer()` 的逐帧 container 写入、`DynamicIslandContentFakeView.restoreFakeViewBackground()` 的 fake root/container 写入。排查时必须逐层确认，不能用一次 `background=null` 推断黑底已清完。
+49. Bionics 分支不会清理 Classic blend colors；进入柔光前清理遗留 blend 是必要的复用卫生，但实机已证明它不是本次持续黑底的充分修复。
+
+## 16. 信息来源和可信度
+
+### SystemUI JADX 已确认
+
+- `DynamicIslandBaseContentView` 字段和关键方法。
+- `DynamicIslandContentFakeView` 层级和生命周期。
+- `onFinishInflate()` 对 `fake_expanded_view` 调用 `updateBackgroundBg()`。
+- `onTrackingFakeViewStart()` 隐藏真实 View 和外层背景。
+- `onTrackingFakeViewUpdate()` 更新动画几何。
+- `updateOutline()` 和 `updateExpandViewBlur()` 更新圆角和 RenderNode。
+- `updateExpandedFakeViewToReal()` 从 fake View 交回真实 View。
+- 系统 `updateBackgroundBg()` 的 Drawable、MiBlur 和 BlendColor 行为。
+- `DynamicIslandContentView.updateExpandedView()` 先更新 EXPAND 材质，再替换通知内容子 View。
+- `DynamicIslandWindowView.updateWindowBlur()` 的 Classic/Bionics 半径分支及 `50/500` 两级半径。
+- `DynamicIslandEventCoordinator` 仅在展开/动画需要时切换 pass-window blur。
+- `FakeViewAnimHelper` 三态目标槽的 Folme `onBegin` 显示时机，以及 fake 槽材质在隐藏期间保持不变。
+- `DynamicIslandBackgroundView.onDraw()` 每帧按 `actual*` 设置 Drawable bounds。
+- `containerScheduleUpdate()` 更新动态背景几何。
+
+### 背景实现已确认
+
+- 通过 `getSmallIslandView()`、`getBigIslandView()` 获取具体 View。
+- 主动调用 `updateBackgroundBg(view, false)` 刷新小岛和大岛。
+- 具体 View getter 用于触发状态背景刷新和提供状态/形状参考。
+
+### 实机日志已确认
+
+- `BackgroundBlurDrawable` 可创建并成功设置半径、圆角和颜色。
+- 焦点真实 View 为 `DynamicIslandExpandedView(expanded_view)`。
+- 同一时段可能存在多个 ContentView 和多个背景 View 实例。
+- `expanded_view` 会在 `state=BIG` 时继续收到过渡布局更新。
+- 双岛时小岛和大岛可同时存在并分别绘制。
+- 外层动态 Drawable 方案已解决内容缩放而模糊固定、双岛错位和突然消失问题。
+- fake 隐藏前可保持 `root alpha=1`、当前 fake 子 View `alpha=1` 且 background 非空；到达后透明再渐显并不等价于 fake mask 问题。
+- 仅开启大岛/焦点模糊时，固定按 `SMALL` 决定共享遮罩会产生随动画移动的遗留黑罩。
+
+### 仍需实机确认
+
+- 焦点通知真实圆角资源或专用背景 Drawable 的准确来源；当前使用 `32dp` 回退值。
+- 不同 HyperOS 版本是否保持相同的 `actual*` 字段和 `onDraw()` 行为。
+
+## 17. 生命周期、安全和性能约束
+
+### 轮廓三态与柔光互斥
+
+- `pref_island_outline_mode` / `pref_focus_outline_mode` 使用 `system`（默认）、`show`、`hide`，不读取旧版常驻显示布尔键。
+- stock `setDrawable()` 发生在 SystemUI `setStroke()` 之前，隐藏必须在完整 `updateDarkLightMode/updateMedianLuma` 事务结束后处理；外层 `dynamic_island_background_big_island_dark` 还含 `stroke_color` 填充，隐藏时一并透明化。不能清除真实内容背景或 Bionics 参数。
+- SOFT 不支持模块轮廓控制，不安装 Overlay 或额外生命周期监听。大岛为 SOFT 时禁用岛轮廓选项；焦点有效材质（含跟随大岛）为 SOFT 时禁用焦点轮廓选项。Hook 在配置加载时将对应模式视为 `system`，不覆盖保存值，避免禁用后旧的强制模式继续生效。
+
+### 媒体通知文本颜色
+
+- `MediaNotificationTextColorHook` 的安装数据缓存必须同时使用弱 View 键和弱岛数据值：岛数据的 `getView()` / `getFakeView()` 会持有 View，强 value 会反向保活弱 key，连带保留通知和整棵 View 树。
+- 安装数据只在 `updateExpandedView()` 调用期间暂存，在 `setContentView()` 消费或更新退出（含异常、复用不重新安装）时移除；缓存最多 128 项。
+- 媒体视图安装和复用更新共用一次性 pre-draw 改色。按资源 ID 定位到的标题和副标题使用有上限的弱引用缓存，回调按 TextView 合并，detach 时退出当前窗口的 pre-draw 监听。原始颜色使用每类最多 128 项的弱键缓存。
+- 焦点通知的完整绑定、局部更新和自定义 RemoteViews 共用同一套 pre-draw 调度，按模块根 View 合并，覆盖真实与 fake 展开内容。两种通知均复用状态栏黑白端点的变更通知。
+- SystemUI OOM 崩溃栈仅能证明堆耗尽，不能替代 heap dump 中的引用链与 retained size 分析；上述泄漏链的修复效果仍需实机长时间播放、切歌和展开/收起验证。
+
+### 17.0 动态 Hook 安装与失败降级
+
+- 动态发现监听 ClassLoader 构造，不监听每次 `loadClass`。BaseDex/Path/DelegateLast 的嵌套构造按线程和实际加载器实例合并，仅在最外层构造成功后分发一次，避免尚未完成构造就探测插件类。
+- 公共入口先验证超级岛 BaseContent/Background 类及方法签名依赖，再分发安装；缺类或依赖尚未就绪时不登记永久失败。ClassLoader 构造、`miui.systemui.plugin` 包回调和 `PluginFactory.createPluginContext()` 返回都可触发就绪探测，不在绘制/手势或每次 `loadClass` 中重试。
+- 每个注册回调使用独立 `ClassLoaderAttemptGate`，在确认就绪后登记安装尝试；使用弱键，最多保留 256 个存活加载器，达到上限时跳过新尝试，不驱逐旧项重新触发失败。已有就绪加载器用有上限的弱引用列表保存，后注册的回调会补装，各回调异常独立隔离。
+- GestureFollow 与 OfficialMaterialCorner 的默认加载器探测先验证就绪再登记。默认加载器缺类不代表插件不支持，后续插件就绪事件和新插件加载器仍可安装，不能全局首次失败后禁用功能。
+- 两项 Hook 的安装失败诊断按功能/候选类仅记录一次，日志字符串延迟构造；成功 Class 的弱集合仍用于防止不同加载器委托到同一 Class 后重复安装。
+- 此机制降低重复安装探测和日志开销，不证明目标 ROM 的类存在或对应视觉功能可用；缺失功能保留系统原行为，实际启动流畅度需实机确认。
+- 开启调试日志后，`HyperIsland[LoaderDiscovery]` 最多记录 120 条加载器诊断：包入口、`miui.systemui.plugin` Context 就绪及 `island-ready` 分发阶段，包含 PID、加载器身份、父加载器、背景类可见性和定义加载器。不记录无关加载器构造或 AOD 插件 Context，避免诊断刷屏。
+
+### 17.1 实时模糊
+
+- `OuterBlur` 使用 `WeakHashMap<DynamicIslandBackgroundView, OuterBlur>` 按实例缓存。
+- BlurDrawable callback 使用弱 View 代理，避免 `Map -> Drawable -> View` 强引用环。
+- 系统原 Drawable在模糊启用期间强引用保存，以保证关闭模糊时可恢复；背景 View detach 或模糊停用时立即移除整个 `OuterBlur`，避免长期保留。
+- 背景 View detach 时将模糊半径设为 `0`、断开 callback、移除缓存和 listener。
+- 状态关闭或切换到自定义图片时立即释放当前 `OuterBlur`。
+- `onDraw()` 热路径只读取预计算的 `anyBlurEnabled` 和弱缓存，不再创建状态集合或扫描历史 View。
+- 所有反射读写都应失败降级；反射异常不能传播到 SystemUI 绘制线程。
+- Bionics source Hook 仅在运行时能力探测成功后注册；OS3 不安装窗口保活、材质清理拦截或 self-blur 改写。
+- SOFT View 在 detach 时释放材质、采样租约、原背景/Outline 快照和 listener；fake 共享层快照使用弱 Drawable 引用，避免 `WeakHashMap key -> value -> Drawable.callback -> key` 环。
+- 延迟 SOFT 提交按具体目标 View 使用 `WeakHashMap`、弱目标引用和一次性 pre-draw；listener 在提交、状态失效、配置切换或 detach 时移除，不能让隐藏的 `currentTempShow` 在每帧执行检查。
+- OS4 共享遮罩清理使用“renderer committed”门禁：只扫描当前弱管理 SOFT View，并按所属 `DynamicIslandBackgroundView` 检查实例级高斯兜底，不按其他岛实例或全局配置推断。
+
+### 17.2 自定义图片和 GIF
+
+- 静态图按最长边进行采样，避免极端宽高比图片以原始尺寸进入 SystemUI。
+- GIF 使用 `ImageDecoder.setTargetSize()` 限制最长边，避免大尺寸动画造成 OOM。
+- 解码失败时保留旧缓存，不回收仍在显示的 Drawable。
+- 已交给 View 的 Bitmap 不手动 `recycle()`，由 GC 在没有引用后回收，避免绘制线程访问 recycled bitmap。
+- 静态图片每个背景 View 使用独立的轻量 Drawable wrapper，共享只读 Bitmap，避免多岛互相覆盖 bounds。
+- 缓存 Drawable 使用弱 callback，不强引用 SystemUI View 树。
+- Hook 去重使用实际目标 Class 的弱集合，不使用可能碰撞的 `identityHashCode`。
+
+### 17.3 残余风险
+
+- GIF 的 `AnimatedImageDrawable` 当前仍是单缓存实例；多个同时可见岛可能共享动画 bounds。若后续出现双岛 GIF 错位，应改为缓存源文件/解码数据并为每个 View 创建独立动画实例。
+- `IslandBackgroundHook` 仍有少量文件存在性和 `lastModified()` 检查发生在 UI 调用链。配置读取已有缓存，但后续可把文件变更检测完全移到配置更新线程。
+- SystemUI 私有字段和方法可能随 HyperOS 版本变化。关键反射成员缺失时必须回退系统原行为，不能继续清空背景。
+
+### 17.4 状态栏文字颜色源
+
+- 默认从 `DarkIconDispatcherImpl` 注册模块自己的 `DarkReceiver`，不监听全局 `TextView#setTextColor`。
+- `applyIconTint()` 仅作为 Receiver 注册失败时的字段读取兼容入口；Clock/MiuiClock 仅在 Dispatcher 类不存在时兜底。
+- 稳定小岛/大岛使用 Dispatcher 已插值的原始 ARGB，并按屏幕中心固定锚点判断 `tintAreas`。
+- 展开态、媒体、焦点和展开计时器使用岛原生 `action_update_light` 的黑白端点，不显示中间色。
+- 岛动画、通知栏和控制中心展开期间冻结颜色；关闭后等待 LightBar 恢复，再合并为一次最终刷新。
+
+## 12. 超级岛性能诊断
+
+「关于 → 调试工具 → 超级岛性能分析」通过签名权限保护的命令广播和 ResultReceiver，在 SystemUI 内按需采集最多 60 秒。SystemUI Hook 创建入口统一使用 `diagnostics/profiledHook` 保持原 API 的优先级、异常与参数语义；未采集时仅检查会话引用，采集时分别记录回调自耗时与包含原链的总耗时，Trace 启用时写入 HI 标记。临时原生状态/动画观察 Hook 仅在采集期间挂载，停止或关闭调试模式后卸载。新 SystemUI Hook 也应使用该入口。
+
+帧回调只统计已观察到、可见的真实/fake 内容，按当前显示刷新率估计 missed vsync，并记录主线程回调迟到。延迟帧附带相邻采样间隔内的主要 Hook；只表示时间关联，不是因果判定或 GPU 耗时。同步直接嵌套工作可重叠，异步任务不在回调耗时内。报告限制 192 个方法、最近 96 条慢事件与 96 条生命周期事件，溢出写入 truncatedHooks；记录覆盖的方法/所属 Hook，未观察到岛时明确为零样本。JSON 仅保存在进程内，由用户主动导出，不进入配置同步、预设或备份。
+
+### 热路径优化（根据两次实机采集定位）
+
+背景遮罩清理的 MiBlur/Bionics API 现在在 Hook 安装时按所属插件内容 Class 解析，并由各运行时自己的 Hook 闭包持有。共享 FrameLayout 的 framework ClassLoader 无法代表插件加载器，不得在 updateContainer 中按其加载器重复查找插件 API。每帧仍清理系统写回的背景、Bionics、blur mode 和 blend，不以 background == null 推断其他通道已经清理。
+
+onPreDraw 预先解析 state 字段和三态具体 View/getter/isAnimating；可见性保留原有祖先 alpha/visibility 检查，只遍历一次；只有目标发生变化时才创建 WeakReference，隐藏完成复查最多同时排队一次。保留真实/fake 交接、暂时隐藏恢复和收起后材质释放。
+
+OuterGlow 的位移/圆角合并为一个位置拦截器。原生位置方法在光效关闭时仍可被调用；报告旧版同一行累计了两个拦截器的调用次数。enabledGlowEffect 明确为 false 且没有待提交/绑定的模块光效时，模块跳过自定义几何处理，仍执行原生方法。只有本模块改过颜色的 View 才执行还原 shader；颜色恢复成功后清除标记。反射成员和缺失结果按实际 Class 隔离缓存，成员弱引用、Class 数与成员数均有上限。上述减少重复工作的效果需要用相同设备、材质和复现步骤重新采集比较，不依据调用次数或包含原链的 totalMs 直接判定卡顿来源。
+
+一次性岛下拉采集中，`handleContentViewUpdateOperate()` 的媒体文字改色 Hook 24 次累计主线程自耗时 62.11 ms，单次最高 5.52 ms。先确认媒体数据再解析真实/fake 展开根节点，反射 getter 按 Class 弱缓存。最大帧间隔 341.16 ms 对应的已统计 Hook 自耗时仅 0.25 ms，采集无法归因其余时间或确认 GPU 耗时。
