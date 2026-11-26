@@ -43,9 +43,18 @@ class Hos2IslandListenerService : NotificationListenerService() {
         if (Settings.canDrawOverlays(this)) ensureView()
     }
 
+    override fun onListenerDisconnected() {
+        // Do not leave a stale floating window if Android revokes listener access.
+        main.post { pill?.visibility = View.GONE }
+        super.onListenerDisconnected()
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+        if (sbn.packageName == packageName) return
         if (!Settings.canDrawOverlays(this)) return
         val n = sbn.notification ?: return
+        // Group summaries duplicate the child notifications and create visual spam.
+        if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
         val extras = n.extras
         val app = runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString() }.getOrDefault(sbn.packageName)
         val heading = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.take(80) ?: app
