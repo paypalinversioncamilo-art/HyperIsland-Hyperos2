@@ -111,4 +111,4 @@ Made with ❤️ for HyperOS users
 
 ## HyperOS 2 fallback port (development)
 
-See `../README-HOS2-PORT.md`. The Android app includes a notification-listener overlay fallback under `android/app/src/main/kotlin/io/github/hyperisland/hos2/`. This is source code and must be built with the Android toolchain before installation.
+See [`HYPEROS2-PORT.md`](HYPEROS2-PORT.md) for the port status and [`BUILD-HYPEROS2-GITHUB.md`](BUILD-HYPEROS2-GITHUB.md) for build and installation steps. The Android app includes a notification-listener overlay fallback under `android/app/src/main/kotlin/io/github/hyperisland/hos2/`. This is source code and must be built with the Android toolchain before installation.
