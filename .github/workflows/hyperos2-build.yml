@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Instalar Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -35,7 +35,8 @@ jobs:
             exit 1
           fi
           echo "SDKMANAGER=$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses
+          # sdkmanager cierra stdin al terminar; evitar que el SIGPIPE de yes tumbe el job.
+          yes | "$SDKMANAGER" --licenses || true
           "$SDKMANAGER" --install "platforms;android-37-ext2" "ndk;28.2.13676358"
 
       - name: Preparar Gradle
