@@ -3,6 +3,7 @@ package io.github.hyperisland.compose.page.home
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -180,6 +181,8 @@ internal fun OverviewPage(
         if (statusAlert != null) {
             item { HomeStatusAlertCard(statusAlert) }
         }
+        // HyperOS 2 has no Focus protocol v3. Offer a public-API notification overlay fallback.
+        item { HyperOS2FallbackCard(context) }
         item { InfoCard(state.systemInfo, state.status) }
         item {
             AppCard {
@@ -241,6 +244,49 @@ private data class HomeStatusAlert(
     val message: String,
     val warning: Boolean = false,
 )
+
+@Composable
+private fun HyperOS2FallbackCard(context: Context) {
+    AppCard {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(
+                text = "HyperOS 2 compatibility mode",
+                style = MiuixTheme.textStyles.headline1,
+                fontWeight = FontWeight.SemiBold,
+                color = MiuixTheme.colorScheme.onSurface,
+            )
+            Text(
+                text = "HyperOS 2 does not expose the Focus protocol required by the original native island. This fallback displays notification content in a floating pill using Android public APIs.",
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.padding(top = 6.dp, bottom = 10.dp),
+            )
+            SettingsAction(
+                title = "Grant notification access",
+                summary = "Required to read incoming notification titles and text",
+                onClick = {
+                    runCatching {
+                        context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                    }
+                },
+            )
+            SettingsAction(
+                title = "Allow display over other apps",
+                summary = "Required to draw the floating island above other apps",
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}"),
+                            ),
+                        )
+                    }
+                },
+            )
+        }
+    }
+}
 
 @Composable
 private fun homeStatusAlert(status: ModuleState?, info: HomeSystemInfo?): HomeStatusAlert? {
